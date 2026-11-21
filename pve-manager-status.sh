@@ -1256,7 +1256,7 @@ echo && sleep 0.5
 
 echo -e "🎚️ 正在动态调整修改后的页面高度:"
 
-# 基于模型: 每行内容 14px (微调), 每个模块段落间额外 4px 间距 (微调)
+# 基于 PVE 9 实际 DOM 行高: 每行 17px, 每个模块底部 2px 分隔线
 calculate_height_increase() {
     local total_lines=0
     local module_count=0
@@ -1269,14 +1269,19 @@ calculate_height_increase() {
     total_lines=$((total_lines + 1))
     module_count=$((module_count + 1))
 
-    # itemId:sensors(传感器): 主信息固定1行
-    total_lines=$((total_lines + 1))
+    # itemId:sensors(传感器): 每个 Package 1 行, 每 4 个核心 1 行
     module_count=$((module_count + 1))
-    local core_temp_count=$(sudo sensors 2>/dev/null | grep -c '^Core')
-    if [ "$core_temp_count" -gt 1 ]; then
-        local sensor_core_lines=$(((core_temp_count + 4 - 1) / 4))
-        total_lines=$((total_lines + sensor_core_lines))
+    local sensor_output=$(sudo sensors 2>/dev/null)
+    local core_temp_count=$(printf '%s\n' "$sensor_output" | grep -c '^Core')
+    local package_count=$(printf '%s\n' "$sensor_output" | grep -cE '^[[:space:]]*(Package id|Tctl)')
+    if [ "$package_count" -lt 1 ]; then
+        package_count=1
     fi
+    local sensor_lines=$package_count
+    if [ "$core_temp_count" -gt 1 ]; then
+        sensor_lines=$((sensor_lines + (core_temp_count + 3) / 4))
+    fi
+    total_lines=$((total_lines + sensor_lines))
 
     # itemId:corefreq(核心频率): 无固定行
     module_count=$((module_count + 1))
@@ -1317,8 +1322,8 @@ calculate_height_increase() {
         total_lines=$((total_lines + 2 + (sata_real_count - 1) * 3))
     fi
 
-    # 【核心修复】行高 14px，间距 4px，彻底挤掉原版的 200px 水分
-    local height_increase=$((total_lines * 14 + module_count * 4))
+    # 【核心修复】按 PVE 实际行高 17px、模块分隔线 2px 计算
+    local height_increase=$((total_lines * 17 + module_count * 2))
     echo $height_increase
 }
 
@@ -1326,7 +1331,8 @@ calculate_height_increase() {
 height_increase=$(calculate_height_increase)
 
 # 基于基础高度(350px)计算新高度
-new_height=$((350 + height_increase))
+# PVE 9 的 pveNodeStatus body 还有 15px 上 + 5px 下 padding, 共 20px, 基础高度未包含这部分
+new_height=$((350 + height_increase + 20))
 
 # 使用 sed 命令定位并更新 PVE.node.StatusView 的 height 属性
 sed -i -E "/Ext[.]define[(]'PVE[.]node[.]StatusView'/,/height:/{s/height: *[0-9]+/height: $new_height/;}" "$pvemanagerlib"

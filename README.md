@@ -29,8 +29,8 @@ PVE-Manager-Status 是一款强大的开源脚本工具, 通过实时基于动�
 - 根据各项硬件的温度和负载, 使用红黄绿色从高到低来显示各项参数的数值.
 - 支持识别多块 NVMe 硬盘, 并根据寿命和压力负载显示动态色彩指标.
 - 完善 zh-CN 本地化, 修复中文环境下缺失的部分翻译.
-- **[本 Fork] 支持 LSI / Broadcom MegaRAID 阵列卡物理硬盘 SMART 监控**, 可显示型号、温度、通电时间、坏道、健康状态、无法纠错数、序列号、生产日期、累计读写量.
-- **[本 Fork] 节点概要页面高度动态计算**: 基础内容按 14px/行 + 4px/模块计算, 阵列卡硬盘按 51px/块追加; 重复执行不会重复累加.
+- **[本 Fork] 支持 LSI / Broadcom MegaRAID 阵列卡物理硬盘 SMART 监控**, 可显示型号、温度、通电时间、坏道、健康状态、无法纠错数、序列号、生产日期、累计读写量、SSD 寿命与不安全断电次数.
+- **[本 Fork] 节点概要页面高度动态计算**: 基础内容按 PVE 实际行高 17px + 2px/模块分隔线计算, 传感器按 Package 数与核心数统计; 阵列卡硬盘按 51px/块追加; 重复执行不会重复累加.
 - **[本 Fork] SMART 解析结果带 60 秒缓存**, 避免 PVE 页面每次刷新都去唤醒阵列卡下的 SAS 硬盘.
 
 ## 如何使用
@@ -87,7 +87,7 @@ wget -O /root/it87-dkms_1.0.63-1_all.deb https://raw.githubusercontent.com/MiKin
 | 项目 | 说明 |
 | --- | --- |
 | 数据读取 | `smartctl -a -d megaraid,<DID> /dev/bus/<N>`, 绕过阵列卡直接读取物理盘 SMART |
-| 解析器 | `/usr/local/bin/pve_storcli_parser.py`, 每块盘输出 10 个字段, 多块盘以双竖线分隔 |
+| 解析器 | `/usr/local/bin/pve_storcli_parser.py`, 每块盘输出 12 个字段, 多块盘以双竖线分隔 |
 | 权限 | `/etc/sudoers.d/pve-storcli`, 允许 `www-data` 免密执行 `smartctl` 与解析器 |
 | 后端注入 | `Nodes.pm` 中在 `$res->{sata_status}` 后注入 `$res->{storcli_status}` |
 | 前端注入 | `pvemanagerlib.js` 中在 `sata_status` 模块后注入阵列卡渲染模块 |
@@ -96,23 +96,30 @@ wget -O /root/it87-dkms_1.0.63-1_all.deb https://raw.githubusercontent.com/MiKin
 
 脚本结束时会重启 `pvedaemon` 与 `pveproxy`, 并打印本次对应的回滚命令.
 
+解析器字段顺序: `型号|温度|通电时间|坏道|健康状态|无法纠错数|序列号|生产日期|读取GB|写入GB|不安全断电|寿命`
+
 监控字段 (每块盘 3 行):
 
 - 第 1 行: 型号 | 温度 | 通电时间 | 健康状态
 - 第 2 行: SN | 生产日期 | 坏道 | 无法纠错数
-- 第 3 行: 累计读取量 | 累计写入量
+- 第 3 行: 寿命 | 不安全断电次数 | 累计读取量 | 累计写入量
 
 显示规则:
 
-- 温度低于 40°C 显示绿色, 40–49°C 显示橙色, 50°C 及以上显示红色.
+- 配色与 NVMe 硬盘模块保持一致: 标签文字使用默认颜色, 仅型号/温度/寿命/坏道等关键数值着色.
+- 温度低于 50°C 显示绿色, 50–69°C 显示橙色, 70°C 及以上显示红色.
 - 坏道数为 0 显示绿色, 非 0 显示橙色; 无法纠错数非 0 显示红色.
+- SSD 寿命 ≥80% 显示绿色, 50–79% 显示橙色, <50% 显示红色; 不安全断电次数与 NVMe 模块一样使用普通文本, 不高亮.
+- HDD 的型号按健康状态着色; 没有寿命/断电统计时对应字段自动隐藏, 只显示读写量.
 - 读取/写入量自动换算为 GB / TB / PB.
-- 生产日期统一为 `Wxx yyyy` 格式 (例如 `W45 2016`).
+- 生产日期统一为 `Wxx yyyy` 格式 (例如 `W45 2016`). SAS 盘直接读取 smartctl 的出厂周; Intel SATA SSD 的 smartctl 不提供出厂日期, 解析器会从 ISN/SN 第 5 位年份和第 6-7 位周数推导.
+- SSD 寿命取自 SMART 属性的归一化 VALUE 列 (例如 Intel `Media_Wearout_Indicator` 的 `099` 显示为 `99%`); 不安全断电次数取自 `Unsafe_Shutdown_Count` 的 RAW_VALUE.
 - 解析器会强制以英文 locale 读取 `smartctl` 输出, 避免中文环境下的字段匹配失败.
 
 ### 高度说明
 
-- `pve-manager-status.sh` 使用 **14px/行 + 4px/模块** 计算基础高度.
+- `pve-manager-status.sh` 使用 **17px/行 + 2px/模块分隔线** 计算基础高度; 传感器按实际 `Package` 数与每 4 个核心 1 行统计, 避免多路 CPU 少算行数.
+- PVE 9 中 `pveNodeStatus` 的 body 高度 = 面板高度 - 46px (标题栏 + 内边距), 且 body 内部还有 20px 上下 padding; 当前模型额外预留 20px, 让 body 内容区略大于 table, 避免最后一行被裁切.
 - 已修正上游 `sata_status` 按 `lsblk` 统计阵列卡虚拟盘导致的高度冗余: 阵列卡虚拟盘读不到底层 SMART 时只按 1 行提示计算.
 - `add-storcli-monitor.sh` 在基础高度上追加 `硬盘数 * 51px`, 并把基础高度与增量记录在 `/var/lib/pve-manager-status/storcli-height.state`.
 - 重复执行不会重复累加; 重跑主脚本后会以新的基础高度重新计算.

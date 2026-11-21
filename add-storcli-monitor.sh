@@ -129,7 +129,7 @@ cat > "$parser_tmp" << 'PYEOF'
 #
 # LSI MegaRAID 物理硬盘 SMART 解析器
 # 输出格式（多块盘用 || 分隔）：
-#   型号|温度|通电时间|坏道|健康状态|无法纠错数|序列号|生产日期|读取GB|写入GB
+#   型号|温度|通电时间|坏道|健康状态|无法纠错数|序列号|生产日期|读取GB|写入GB|不安全断电|寿命
 #
 # 说明：
 #   - 统一使用 LC_ALL=C 读取 smartctl 输出，避免本地化导致的解析失败
@@ -201,6 +201,24 @@ def _attr_raw(line):
     return ""
 
 
+def _attr_value(line):
+    """SMART 属性的归一化 VALUE 列（第 4 列，索引 3）。"""
+    parts = line.split()
+    if len(parts) >= 10:
+        return parts[3]
+    return ""
+
+
+# 不同 SSD 厂商表示“剩余寿命/磨损指标”的属性名
+LIFE_ATTRIBUTES = (
+    "Media_Wearout_Indicator",
+    "Wear_Leveling_Count",
+    "SSD_Life_Left",
+    "Percent_Lifetime_Remain",
+    "Remaining_Lifetime_Perc",
+)
+
+
 def _leading_int(value):
     match = re.match(r"(\d+)", value or "")
     return int(match.group(1)) if match else None
@@ -223,6 +241,8 @@ def parse_disk(text):
     mfg = "-"
     read_gb = 0.0
     write_gb = 0.0
+    unsafe_shutdown = "-"
+    life = "-"
     is_ssd = False
 
     for raw_line in text.splitlines():
@@ -281,8 +301,23 @@ def parse_disk(text):
             value = _leading_int(_attr_raw(line))
             if value:
                 uncorrected += value
+        elif "Unsafe_Shutdown_Count" in line or "Power_Loss_Count" in line:
+            value = _leading_int(_attr_raw(line))
+            if value is not None:
+                unsafe_shutdown = value
+        elif any(name in line for name in LIFE_ATTRIBUTES):
+            # SSD 的剩余寿命看归一化 VALUE 列，例如 Intel 的 233 = 099 表示 99%
+            value = _leading_int(_attr_value(line))
+            if value is not None:
+                life = value
+        elif "Percentage used endurance indicator:" in line:
+            # SAS SSD：用“已用寿命百分比”反推剩余寿命
+            match = re.search(r"(\d+)\s*%", line)
+            if match:
+                life = max(0, 100 - int(match.group(1)))
         elif (
             "Temperature_Celsius" in line
+            or "Temperature_Case" in line
             or "Temperature_Internal" in line
             or "Airflow_Temperature_Cel" in line
         ):
@@ -318,6 +353,16 @@ def parse_disk(text):
     if model == "未知":
         return None
 
+    # SATA SSD 的 smartctl 输出没有生产日期字段。
+    # Intel SSD 的 ISN/SN 第 5 位是年份、第 6-7 位是周数，例如 PHWA631... => 2016 年第 31 周。
+    if mfg == "-" and "INTEL" in model.upper():
+        match = re.match(r"^[A-Z]{4}(\d)(\d{2})", serial.upper())
+        if match:
+            year = 2010 + int(match.group(1))
+            week = int(match.group(2))
+            if 1 <= week <= 53:
+                mfg = "W{:02d} {}".format(week, year)
+
     if is_ssd and "(SSD)" not in model:
         model = model + " (SSD)"
 
@@ -335,6 +380,8 @@ def parse_disk(text):
         _clean(mfg, "-"),
         read_str,
         write_str,
+        _clean(unsafe_shutdown, "-"),
+        _clean(life, "-"),
     ]
     return "|".join(values)
 
@@ -655,11 +702,24 @@ MODULE = r"""
             if (gb < 1) return (gb * 1024).toFixed(1) + ' MB';
             return gb.toFixed(1) + ' GB';
         }
+        function getLifeColor(life) {
+            var n = parseInt(life, 10);
+            if (isNaN(n)) return null;
+            if (n < 50) return 'var(--pve-manager-status-high, #ff0000)';
+            if (n < 80) return 'var(--pve-manager-status-medium, #ffa500)';
+            return 'var(--pve-manager-status-low, #008000)';
+        }
+        function colorizeModel(model, life, health) {
+            // 与 NVMe 一致：SSD 按寿命着色；HDD 没有寿命字段时按健康状态着色
+            var color = getLifeColor(life);
+            if (!color) color = health === 'OK' ? 'var(--pve-manager-status-low, #008000)' : 'var(--pve-manager-status-high, #ff0000)';
+            return '<span style="color:' + color + '; font-weight:bold;">' + esc(model) + '</span>';
+        }
         function colorizeTemp(temp) {
             var t = parseInt(temp, 10);
             if (isNaN(t)) return '<span>' + esc(temp) + '</span>';
-            if (t < 40) return '<span style="color:var(--pve-manager-status-low, #008000); font-weight:bold;">' + t + '°C</span>';
-            if (t < 50) return '<span style="color:var(--pve-manager-status-medium, #ffa500); font-weight:bold;">' + t + '°C</span>';
+            if (t < 50) return '<span style="color:var(--pve-manager-status-low, #008000); font-weight:bold;">' + t + '°C</span>';
+            if (t < 70) return '<span style="color:var(--pve-manager-status-medium, #ffa500); font-weight:bold;">' + t + '°C</span>';
             return '<span style="color:var(--pve-manager-status-high, #ff0000); font-weight:bold;">' + t + '°C</span>';
         }
         function colorizeNum(num, isError) {
@@ -668,6 +728,18 @@ MODULE = r"""
             if (n === 0) return '<span style="color:var(--pve-manager-status-low, #008000);">0</span>';
             var color = isError ? 'var(--pve-manager-status-high, #ff0000)' : 'var(--pve-manager-status-medium, #ffa500)';
             return '<span style="color:' + color + '; font-weight:bold;">' + n + '</span>';
+        }
+        function colorizeLife(life) {
+            var n = parseInt(life, 10);
+            if (isNaN(n)) return esc(life);
+            var color = getLifeColor(life);
+            return '<span style="color:' + color + '; font-weight:bold;">' + n + '%</span>';
+        }
+        function colorizeUnsafe(count) {
+            // NVMe 模块中的“不安全断电”是不高亮的普通文本，这里保持一致
+            var n = parseInt(count, 10);
+            if (isNaN(n)) return esc(count);
+            return n + '次';
         }
         var disks = String(value).split('||').filter(function(x) { return x.trim() !== ''; });
         var output = [];
@@ -679,17 +751,23 @@ MODULE = r"""
             }
             var model = d[0], temp = d[1], hour = d[2], defects = d[3], health = d[4];
             var uncorrected = d[5], serial = d[6], mfg = d[7], readgb = d[8], writegb = d[9];
+            var unsafe = d.length > 10 ? d[10] : '-';
+            var life = d.length > 11 ? d[11] : '-';
             var hours = parseInt(hour, 10);
             var years = isNaN(hours) ? '-' : (hours / 8760).toFixed(1);
             var healthColor = health === 'OK' ? 'var(--pve-manager-status-low, #008000)' : 'var(--pve-manager-status-high, #ff0000)';
-            var line1 = '<strong>' + esc(model) + '</strong> | 温度: ' + colorizeTemp(temp) +
+            var line1 = colorizeModel(model, life, health) + ' | 温度: ' + colorizeTemp(temp) +
                         ' | 通电: ' + (isNaN(hours) ? esc(hour) : hours + 'h (' + years + '年)') +
                         ' | 状态: <span style="color:' + healthColor + '; font-weight:bold;">' + esc(health) + '</span>';
-            var line2 = '<span style="color:var(--pve-manager-status-medium, #ffa500);">SN: ' + esc(serial) +
+            var line2 = 'SN: ' + esc(serial) +
                         ' | 生产: ' + esc(mfg) + ' | 坏道: ' + colorizeNum(defects, false) +
-                        ' | 无法纠错: ' + colorizeNum(uncorrected, true) + '</span>';
-            var line3 = '<span style="color:var(--pve-manager-status-medium, #ffa500);">寿命累计 | 已读: ' +
-                        formatSize(readgb) + ' | 已写: ' + formatSize(writegb) + '</span>';
+                        ' | 无法纠错: ' + colorizeNum(uncorrected, true);
+            var line3Parts = [];
+            if (!isNaN(parseInt(life, 10))) line3Parts.push('寿命: ' + colorizeLife(life));
+            if (!isNaN(parseInt(unsafe, 10))) line3Parts.push('不安全断电: ' + colorizeUnsafe(unsafe));
+            line3Parts.push('已读: ' + formatSize(readgb));
+            line3Parts.push('已写: ' + formatSize(writegb));
+            var line3 = line3Parts.join(' | ');
             output.push(line1 + '<br>' + line2 + '<br>' + line3);
         }
         return output.join('<br>');
