@@ -1,4 +1,4 @@
-# PVE-Manager-Status
+å# PVE-Manager-Status
 为你的 ProxmoxVE 节点概要页面添加扩展的硬件监控信息
 
 无论是小型 HomeLab 还是多节点的大型集群, 借助 PVE-Manager-Status 让你对当前服务器硬件状态了如指掌!
@@ -18,6 +18,8 @@ PVE-Manager-Status 是一款强大的开源脚本工具, 通过实时基于动�
 本 Fork 并非上游官方发布版本，新增的阵列卡功能由本仓库维护。本仓库与原项目均遵循 MIT License，使用前请阅读下方的免责声明，并先在测试环境中充分验证。
 
 <img width="1120" height="699" alt="image" src="https://github.com/user-attachments/assets/51224701-a763-4b14-9951-5990f7e22901" />
+<img width="1899" height="2355" alt="pve08-Proxmox-Virtual-Environment-11-21-2026_10_17_PM" src="https://github.com/user-attachments/assets/ef0d678d-dca0-4d2b-9a76-0551a1834298" />
+
 
 ## 免责声明
 
