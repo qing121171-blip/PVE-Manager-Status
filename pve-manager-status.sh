@@ -1256,7 +1256,7 @@ echo && sleep 0.5
 
 echo -e "🎚️ 正在动态调整修改后的页面高度:"
 
-# 基于模型: 每行内容 17px, 每个模块段落间额外 7px 间距
+# 基于模型: 每行内容 14px (微调), 每个模块段落间额外 4px 间距 (微调)
 calculate_height_increase() {
     local total_lines=0
     local module_count=0
@@ -1272,7 +1272,6 @@ calculate_height_increase() {
     # itemId:sensors(传感器): 主信息固定1行
     total_lines=$((total_lines + 1))
     module_count=$((module_count + 1))
-    # 使用 sensors 命令输出根据核心数量计算额外行数
     local core_temp_count=$(sudo sensors 2>/dev/null | grep -c '^Core')
     if [ "$core_temp_count" -gt 1 ]; then
         local sensor_core_lines=$(((core_temp_count + 4 - 1) / 4))
@@ -1281,7 +1280,6 @@ calculate_height_increase() {
 
     # itemId:corefreq(核心频率): 无固定行
     module_count=$((module_count + 1))
-    # 根据 /proc/cpuinfo 输出的线程数量计算额外行数
     local thread_count=$(grep -c ^processor /proc/cpuinfo)
     if [ "$thread_count" -gt 0 ]; then
         local core_freq_lines=$(((thread_count + 4 - 1) / 4))
@@ -1296,20 +1294,31 @@ calculate_height_increase() {
         module_count=$((module_count + nvme_count))
     fi
 
-    # itemId:sata_status(SATA硬盘): 无固定行
+    # itemId:sata_status(SATA硬盘): 智能判断阵列卡环境
     module_count=$((module_count + 1))
-    local sata_count=$(lsblk -d -o NAME | grep -c 'sd[a-z]')
-    if [ "$sata_count" -gt 0 ]; then
-        # 第1个SATA硬盘占2行, 后续每个占3行(含1行间距)
-        local sata_lines=$((2 + (sata_count - 1) * 3))
-        total_lines=$((total_lines + sata_lines))
-    else
-        # 不存在SATA硬盘时, 占用1行显示提示信息
-        total_lines=$((total_lines + 1))
+    local sata_lsblk_count=$(lsblk -d -o NAME | grep -c 'sd[a-z]')
+    # 运行时直接统计 smartctl 能读出 SMART 信息的物理盘数量.
+    # 不要到 Nodes.pm 里 grep "Device Model": 那条命令的 grep 模式本身就包含该关键字,
+    # 会永远匹配到命令自身, 从而把阵列卡虚拟盘误判成真实盘并多算高度.
+    local sata_real_count=0
+    if [ "$sata_lsblk_count" -gt 0 ] && command -v smartctl >/dev/null 2>&1; then
+        sata_real_count=$(timeout 8s sudo smartctl -a /dev/sd? 2>/dev/null | grep -cE '^[[:space:]]*Device Model:')
     fi
 
-    # 根据模型计算总高度增量: (行数 * 17px) + (模块数 * 7px)
-    local height_increase=$((total_lines * 17 + module_count * 7))
+    if [ "$sata_lsblk_count" -eq 0 ]; then
+        # 无盘, 页面显示1行提示
+        total_lines=$((total_lines + 1))
+    elif [ "$sata_real_count" -eq 0 ]; then
+        # 只有阵列卡虚拟盘 (如 /dev/sda), smartctl 读不到底层盘, 页面仅显示1行提示
+        total_lines=$((total_lines + 1))
+    else
+        # 以实际能读出 SMART 的物理盘为准: 第1块占2行, 后续每块占3行(含1行间距);
+        # 阵列卡环境下的虚拟盘不再计入高度
+        total_lines=$((total_lines + 2 + (sata_real_count - 1) * 3))
+    fi
+
+    # 【核心修复】行高 14px，间距 4px，彻底挤掉原版的 200px 水分
+    local height_increase=$((total_lines * 14 + module_count * 4))
     echo $height_increase
 }
 
@@ -1320,7 +1329,7 @@ height_increase=$(calculate_height_increase)
 new_height=$((350 + height_increase))
 
 # 使用 sed 命令定位并更新 PVE.node.StatusView 的 height 属性
-sed -i -E "/Ext.define\('PVE.node.StatusView'/,/height:/{s/height: *[0-9]+,/height: $new_height,/}" "$pvemanagerlib"
+sed -i -E "/Ext[.]define[(]'PVE[.]node[.]StatusView'/,/height:/{s/height: *[0-9]+/height: $new_height/;}" "$pvemanagerlib"
 echo "页面高度经计算模型已动态调整为 ${new_height}px ✅"
 
 echo && sleep 0.5
