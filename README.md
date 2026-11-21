@@ -45,6 +45,7 @@ PVE-Manager-Status 是一款强大的开源脚本工具, 通过实时基于动�
 5) 完整恢复 PVE 原始状态 (清除所有修改)
 6) 查看当前状态
 7) 立即刷新阵列卡缓存
+8) 移除 PVE 企业订阅源 (修复 apt update)
 0) 退出
 ```
 
@@ -78,6 +79,7 @@ bash pve-manager-status.sh status           # 查看安装/缓存/定时器状�
 bash pve-manager-status.sh update-cache     # 立即刷新阵列卡缓存
 bash pve-manager-status.sh storcli-uninstall # 只卸载阵列卡监控
 bash pve-manager-status.sh restore          # 完整恢复 PVE 原始状态
+bash pve-manager-status.sh repo-fix         # 移除企业订阅源, 修复 apt update 401
 bash pve-manager-status.sh help             # 查看帮助
 ```
 
@@ -89,6 +91,7 @@ bash pve-manager-status.sh help             # 查看帮助
 - `install-storcli-monitor.sh`: 阵列卡监控安装模块（供统一入口调用）.
 - `uninstall-storcli-monitor.sh`: 阵列卡监控卸载模块.
 - `restore-pve-original.sh`: 完整恢复 PVE 原始文件（不依赖 .bak，适合多次运行后备份已被污染的情况）.
+- `remove-pve-enterprise-repo.sh`: 移除 PVE 企业订阅源，修复未订阅环境下 `apt-get update` 的 401 错误.
 - `add-storcli-monitor.sh`: 旧入口, 已改为转调安装模块, 保留兼容.
 
 > [!IMPORTANT]
@@ -247,6 +250,31 @@ bash pve-manager-status.sh restore --yes
 - 重启 `pvedaemon` / `pveproxy`
 
 > 依赖包（sudo/sysstat/lm-sensors/smartmontools/linux-cpupower）、`it87-dkms` 以及 `/etc/modules` 中 sensors-detect 追加的模块不会自动卸载；脚本结束时会提示，需自行确认后处理。
+
+### 修复 apt update：移除企业订阅源
+
+未购买 PVE 企业订阅时，`enterprise.proxmox.com` 会返回 401，导致：
+
+```text
+E: Failed to fetch https://enterprise.proxmox.com/debian/pve/dists/trixie/InRelease 401 Unauthorized
+```
+
+执行：
+
+```bash
+bash pve-manager-status.sh repo-fix
+```
+
+或在交互式菜单选择 `8`。
+
+脚本会：
+
+- 备份 `/etc/apt/sources.list` 与 `/etc/apt/sources.list.d/` 下相关文件
+- 注释或移除 `enterprise.proxmox.com` 源
+- 确认存在 `pve-no-subscription` 源；没有则添加官方源
+- 执行 `apt-get update` 验证
+
+备份目录：`/var/backups/pve-manager-status/apt-enterprise-<时间戳>/`
 
 ## 已知问题
 
