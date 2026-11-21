@@ -1,0 +1,9 @@
+# macOS 附属信息
+.DS_Store
+._*
+__MACOSX/
+
+# 编辑器/临时文件
+*.swp
+*.swo
+*.tmp

@@ -1,6 +1,207 @@
 #!/bin/bash
 # pve-manager-status.sh
 # Last Modified: 2026-11-14
+#
+# 统一入口脚本:
+#   bash pve-manager-status.sh                交互式菜单 (推荐)
+#   bash pve-manager-status.sh install        基础监控 + 阵列卡监控
+#   bash pve-manager-status.sh base           仅基础监控
+#   bash pve-manager-status.sh storcli-install
+#   bash pve-manager-status.sh storcli-uninstall
+#   bash pve-manager-status.sh update-cache
+#   bash pve-manager-status.sh status
+#   bash pve-manager-status.sh restore
+#
+# 内部实现仍拆分为独立模块, 便于维护; 日常使用只需记住本入口。
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+usage() {
+    cat <<'EOF'
+用法: bash pve-manager-status.sh [命令]
+
+命令:
+  install              安装基础监控 + 阵列卡监控 (推荐)
+  base                 仅安装/重装基础监控
+  storcli-install      仅安装阵列卡监控
+  storcli-uninstall    卸载阵列卡监控, 恢复到安装阵列卡之前
+  update-cache         立即刷新阵列卡 SMART 缓存
+  status               查看安装/缓存/定时器状态
+  restore              完整恢复 PVE 原始状态 (清除所有修改)
+  help                 显示本帮助
+
+示例:
+  bash pve-manager-status.sh                # 打开交互式菜单
+  bash pve-manager-status.sh install
+  bash pve-manager-status.sh status
+  bash pve-manager-status.sh restore
+
+不带参数且在终端中运行时会打开交互式菜单.
+EOF
+}
+
+run_component() {
+    local script="$1"
+    shift
+    if [ ! -f "$script" ]; then
+        echo -e "⛔ 未找到组件脚本: ${script}" >&2
+        exit 1
+    fi
+    exec bash "$script" "$@"
+}
+
+interactive_menu() {
+    while true; do
+        cat <<'EOF'
+============================================================
+ PVE-Manager-Status 交互式安装/维护
+============================================================
+  1) 一键安装/更新: 基础监控 + 阵列卡监控  (推荐)
+  2) 仅安装/更新:   基础监控
+  3) 仅安装/更新:   阵列卡监控
+  4) 卸载阵列卡监控 (保留基础监控)
+  5) 完整恢复 PVE 原始状态 (清除所有修改)
+  6) 查看当前状态
+  7) 立即刷新阵列卡缓存
+  0) 退出
+============================================================
+EOF
+        read -r -p "请输入选项 [0-7]: " choice || exit 1
+        case "$choice" in
+            1) exec bash "$0" install --yes ;;
+            2) exec bash "$0" base --yes ;;
+            3) exec bash "$0" storcli-install ;;
+            4) exec bash "$0" storcli-uninstall ;;
+            5) exec bash "$0" restore ;;
+            6) exec bash "$0" status ;;
+            7) exec bash "$0" update-cache ;;
+            0) echo -e "\n👋 已退出"; exit 0 ;;
+            *) echo -e "⚠️ 无效选项, 请重新输入." ;;
+        esac
+    done
+}
+
+case "${1:-}" in
+    help|-h|--help)
+        usage
+        exit 0
+        ;;
+    install|all)
+        shift
+        assume_yes=0
+        for arg in "$@"; do
+            if [ "$arg" = "--yes" ] || [ "$arg" = "-y" ]; then
+                assume_yes=1
+            fi
+        done
+
+        if [ "$assume_yes" -eq 0 ]; then
+            read -p "确认安装基础监控 + 阵列卡监控? [y/N]:" para
+            case "$para" in
+                y|Y|yes|YES) ;;
+                n|N|no|NO) echo -e "\n🚫 操作取消, 未执行任何操作!"; exit 0 ;;
+                *) echo -e "\n⚠️ 无效输入, 未执行任何操作!"; exit 1 ;;
+            esac
+        fi
+
+        echo -e "\n===== 1/2 基础硬件监控 ====="
+        bash "$0" base --yes || {
+            echo -e "⛔ 基础监控安装失败, 终止" >&2
+            exit 1
+        }
+        echo -e "\n===== 2/2 阵列卡 SMART 监控 ====="
+        run_component "${SCRIPT_DIR}/install-storcli-monitor.sh" "$@"
+        ;;
+    storcli-install|install-storcli)
+        shift
+        run_component "${SCRIPT_DIR}/install-storcli-monitor.sh" "$@"
+        ;;
+    storcli-uninstall|uninstall-storcli)
+        shift
+        run_component "${SCRIPT_DIR}/uninstall-storcli-monitor.sh" "$@"
+        ;;
+    restore|restore-original)
+        shift
+        run_component "${SCRIPT_DIR}/restore-pve-original.sh" "$@"
+        ;;
+    update-cache|refresh-cache)
+        if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/pve-storcli-cache.service ]; then
+            if systemctl start pve-storcli-cache.service; then
+                echo "缓存已刷新 ✅"
+            else
+                echo -e "⚠️ 服务刷新失败, 尝试直接执行更新器..."
+                /usr/local/bin/pve_storcli_cache_updater.sh || exit 1
+            fi
+        elif [ -x /usr/local/bin/pve_storcli_cache_updater.sh ]; then
+            /usr/local/bin/pve_storcli_cache_updater.sh || exit 1
+        else
+            echo -e "⛔ 未找到阵列卡缓存更新器, 请先执行: bash $0 storcli-install" >&2
+            exit 1
+        fi
+        if [ -s /var/cache/pve-manager/storcli_status.cache ]; then
+            echo "当前缓存: $(head -n1 /var/cache/pve-manager/storcli_status.cache | cut -c1-160)..."
+        fi
+        exit 0
+        ;;
+    status)
+        echo -e "\n📊 PVE-Manager-Status 状态"
+        if command -v pveversion >/dev/null 2>&1; then
+            echo "PVE 版本: $(pveversion | awk -F'/' '{print $2}')"
+        fi
+
+        if [ -f /etc/systemd/system/pve-storcli-cache.timer ]; then
+            echo "定时器: $(systemctl is-active pve-storcli-cache.timer 2>/dev/null || true)"
+            systemctl list-timers pve-storcli-cache.timer --no-pager 2>/dev/null | head -n 2 || true
+        else
+            echo "定时器: 未安装"
+        fi
+
+        cache_file="/var/cache/pve-manager/storcli_status.cache"
+        if [ -f "$cache_file" ]; then
+            cache_line=$(head -n1 "$cache_file" 2>/dev/null)
+            if [ -n "$cache_line" ]; then
+                disk_count=$(( $(printf '%s' "$cache_line" | grep -o '||' | wc -l) + 1 ))
+                echo "缓存: ${disk_count} 块盘, $(wc -c < "$cache_file" | tr -d ' ') bytes"
+                echo "样例: $(printf '%s' "$cache_line" | cut -c1-160)..."
+            else
+                echo "缓存: 空 (当前无阵列卡硬盘, 或尚未刷新)"
+            fi
+        else
+            echo "缓存: 不存在"
+        fi
+
+        if grep -q 'storcli_status' /usr/share/perl5/PVE/API2/Nodes.pm 2>/dev/null; then
+            echo "Nodes.pm: 已注入"
+        else
+            echo "Nodes.pm: 未注入"
+        fi
+
+        if grep -q "itemId: 'storcli_status'" /usr/share/pve-manager/js/pvemanagerlib.js 2>/dev/null; then
+            echo "pvemanagerlib.js: 已注入"
+        else
+            echo "pvemanagerlib.js: 未注入"
+        fi
+
+        for backup in /usr/share/perl5/PVE/API2/Nodes.pm.storcli.bak /usr/share/pve-manager/js/pvemanagerlib.js.storcli.bak; do
+            [ -f "$backup" ] && echo "备份: $backup"
+        done
+        exit 0
+        ;;
+    base)
+        shift
+        ;;
+    "")
+        if [ -t 0 ]; then
+            interactive_menu
+        fi
+        # 非交互环境保持原有行为: 仅基础监控
+        ;;
+    *)
+        echo -e "⛔ 未知命令: $1" >&2
+        usage
+        exit 1
+        ;;
+esac
 
 echo -e "\n🛠️ \033[1;33;41mPVE-Manager-Status v0.6.4 by MiKing233\033[0m"
 
@@ -28,8 +229,16 @@ if ! command -v pveversion &> /dev/null; then
 fi
 
 # 脚本执行前确认
-read -p "确认执行吗? [y/N]:" para
-[[ "$para" =~ ^[Yy]$ ]] || { [[ "$para" =~ ^[Nn]$ ]] && echo -e "\n🚫 操作取消, 未执行任何操作!\n" && exit 0; echo -e "\n⚠️ 无效输入, 未执行任何操作!\n"; exit 1; }
+assume_yes=0
+if [ "${1:-}" = "--yes" ] || [ "${1:-}" = "-y" ]; then
+    assume_yes=1
+    echo -e "已指定 --yes, 跳过基础脚本确认."
+fi
+
+if [ "$assume_yes" -eq 0 ]; then
+    read -p "确认执行吗? [y/N]:" para
+    [[ "$para" =~ ^[Yy]$ ]] || { [[ "$para" =~ ^[Nn]$ ]] && echo -e "\n🚫 操作取消, 未执行任何操作!\n" && exit 0; echo -e "\n⚠️ 无效输入, 未执行任何操作!\n"; exit 1; }
+fi
 
 nodes="/usr/share/perl5/PVE/API2/Nodes.pm"
 pvemanagerlib="/usr/share/pve-manager/js/pvemanagerlib.js"
@@ -39,55 +248,9 @@ pve_major_ver=$(echo "$pvever" | cut -d'.' -f1)
 
 echo -e "\n⚙️ 当前 Proxmox VE 版本: $pvever"
 
-####################   配置文件备份步骤   ####################
-
-echo -e "\n💾 正在备份原文件:"
-
-delete_old_backups() {
-    local pattern="$1"
-    local description="$2"
-
-    shopt -s nullglob
-    local files=($pattern)
-    shopt -u nullglob
-
-    if [ ${#files[@]} -gt 0 ]; then
-        for file in "${files[@]}"; do
-            echo "旧备份清理: $file ♻️"
-        done
-        rm -f "${files[@]}"
-    else
-        echo "没有发现任何旧备份文件! ♻️"
-    fi
-}
-echo -e "清理旧的备份文件..."
-delete_old_backups "${nodes}.*.bak" "nodes"
-delete_old_backups "${pvemanagerlib}.*.bak" "pvemanagerlib"
-delete_old_backups "${pve_i18n_CN}.*.bak" "pve_i18n_CN"
-
-echo -e "备份当前将要被修改的文件..."
-
-cp "$nodes" "${nodes}.${pvever}.bak" || {
-    echo "⛔ 备份失败: $nodes"
-    exit 1
-}
-echo "新备份生成: ${nodes}.${pvever}.bak ✅"
-
-cp "$pvemanagerlib" "${pvemanagerlib}.${pvever}.bak" || {
-    echo "⛔ 备份失败: $pvemanagerlib"
-    exit 1
-}
-echo "新备份生成: ${pvemanagerlib}.${pvever}.bak ✅"
-
-cp "$pve_i18n_CN" "${pve_i18n_CN}.${pvever}.bak" || {
-    echo "⛔ 备份失败: $pve_i18n_CN"
-    exit 1
-}
-echo "新备份生成: ${pve_i18n_CN}.${pvever}.bak ✅"
-
-echo && sleep 0.5
-
 ####################   修改前重装软件包避免重复修改   ####################
+# 注意: 必须先重装软件包, 再执行下面的备份步骤.
+# 否则备份到的是上一次修改后的文件, 无法回滚到真正的原始状态.
 
 spinner() {
     local pid=$1
@@ -134,6 +297,54 @@ if [ ${#reinstall_failed[@]} -ne 0 ]; then
 else
     echo -e "相关软件包已重装完成!"
 fi
+
+echo && sleep 0.5
+
+####################   配置文件备份步骤   ####################
+
+echo -e "\n💾 正在备份原文件:"
+
+delete_old_backups() {
+    local pattern="$1"
+    local description="$2"
+
+    shopt -s nullglob
+    local files=($pattern)
+    shopt -u nullglob
+
+    if [ ${#files[@]} -gt 0 ]; then
+        for file in "${files[@]}"; do
+            echo "旧备份清理: $file ♻️"
+        done
+        rm -f "${files[@]}"
+    else
+        echo "没有发现任何旧备份文件! ♻️"
+    fi
+}
+echo -e "清理旧的备份文件..."
+delete_old_backups "${nodes}.*.bak" "nodes"
+delete_old_backups "${pvemanagerlib}.*.bak" "pvemanagerlib"
+delete_old_backups "${pve_i18n_CN}.*.bak" "pve_i18n_CN"
+
+echo -e "备份重装后的原始文件 (用于回滚到本次执行前的 PVE 原始状态)..."
+
+cp "$nodes" "${nodes}.${pvever}.bak" || {
+    echo "⛔ 备份失败: $nodes"
+    exit 1
+}
+echo "新备份生成: ${nodes}.${pvever}.bak ✅"
+
+cp "$pvemanagerlib" "${pvemanagerlib}.${pvever}.bak" || {
+    echo "⛔ 备份失败: $pvemanagerlib"
+    exit 1
+}
+echo "新备份生成: ${pvemanagerlib}.${pvever}.bak ✅"
+
+cp "$pve_i18n_CN" "${pve_i18n_CN}.${pvever}.bak" || {
+    echo "⛔ 备份失败: $pve_i18n_CN"
+    exit 1
+}
+echo "新备份生成: ${pve_i18n_CN}.${pvever}.bak ✅"
 
 echo && sleep 0.5
 
@@ -1381,5 +1592,8 @@ if [ ${#rollback_commands[@]} -gt 0 ]; then
 else
     echo -e "♻️ 在本次修改中文件内容均未发生变更."
 fi
+
+echo -e "\n🧹 如需连同阵列卡监控一起完整恢复 PVE 原始状态, 请执行:"
+echo -e "   bash ${SCRIPT_DIR}/pve-manager-status.sh restore\n"
 
 echo -e "\n♻️ 请使用 Ctrl + Shift + R 刷新浏览器 Proxmox VE Web 管理页面缓存\n"

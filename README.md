@@ -31,30 +31,72 @@ PVE-Manager-Status 是一款强大的开源脚本工具, 通过实时基于动�
 - 完善 zh-CN 本地化, 修复中文环境下缺失的部分翻译.
 - **[本 Fork] 支持 LSI / Broadcom MegaRAID 阵列卡物理硬盘 SMART 监控**, 可显示型号、温度、通电时间、坏道、健康状态、无法纠错数、序列号、生产日期、累计读写量、SSD 寿命与不安全断电次数.
 - **[本 Fork] 节点概要页面高度动态计算**: 基础内容按 PVE 实际行高 17px + 2px/模块分隔线计算, 传感器按 Package 数与核心数统计; 阵列卡硬盘按 51px/块追加; 重复执行不会重复累加.
-- **[本 Fork] SMART 解析结果带 60 秒缓存**, 避免 PVE 页面每次刷新都去唤醒阵列卡下的 SAS 硬盘.
+- **[本 Fork] systemd timer 每 5 分钟后台刷新阵列卡 SMART 缓存**, PVE 页面只读取缓存文件, 页面请求中不执行任何 smartctl/耗时命令.
 
 ## 如何使用
 
-本 Fork 的安装分为两步, **顺序不能颠倒**:
+现在只需要记住一个入口脚本 `pve-manager-status.sh`, 直接运行会打开交互式菜单:
+
+```text
+1) 一键安装/更新: 基础监控 + 阵列卡监控  (推荐)
+2) 仅安装/更新:   基础监控
+3) 仅安装/更新:   阵列卡监控
+4) 卸载阵列卡监控 (保留基础监控)
+5) 完整恢复 PVE 原始状态 (清除所有修改)
+6) 查看当前状态
+7) 立即刷新阵列卡缓存
+0) 退出
+```
+
+也可以直接用参数执行, 便于自动化:
 
 ```bash
 git clone https://github.com/qing121171-blip/PVE-Manager-Status.git
 cd PVE-Manager-Status
 
-# 1. 安装基础硬件监控 + 动态高度
-bash pve-manager-status.sh
+# 一键安装: 基础硬件监控 + 阵列卡 SMART 监控
+bash pve-manager-status.sh install
 
-# 2. 在基础脚本之后, 安装阵列卡 SMART 监控
-bash add-storcli-monitor.sh
+# 非交互安装 (跳过确认)
+bash pve-manager-status.sh install --yes
+```
+
+也可以分步执行:
+
+```bash
+# 只安装/重装基础硬件监控 + 动态高度
+bash pve-manager-status.sh base
+
+# 只安装阵列卡 SMART 监控 (需要先执行 base)
+bash pve-manager-status.sh storcli-install
+```
+
+常用命令:
+
+```bash
+bash pve-manager-status.sh status           # 查看安装/缓存/定时器状态
+bash pve-manager-status.sh update-cache     # 立即刷新阵列卡缓存
+bash pve-manager-status.sh storcli-uninstall # 只卸载阵列卡监控
+bash pve-manager-status.sh restore          # 完整恢复 PVE 原始状态
+bash pve-manager-status.sh help             # 查看帮助
 ```
 
 安装完成后, 使用 `Ctrl + Shift + R` 强制刷新浏览器 Proxmox VE Web 管理页面缓存.
 
-> [!IMPORTANT]
-> `pve-manager-status.sh` 每次运行都会重装 `pve-manager` / `pve-i18n`, 这会清掉阵列卡注入.  
-> 因此, **每次重跑 `pve-manager-status.sh` 后, 都必须再执行一次 `add-storcli-monitor.sh`.**
+脚本说明:
 
-`add-storcli-monitor.sh` 的前置条件:
+- `pve-manager-status.sh`: 统一入口 + 基础硬件监控 + 页面高度模型.
+- `install-storcli-monitor.sh`: 阵列卡监控安装模块（供统一入口调用）.
+- `uninstall-storcli-monitor.sh`: 阵列卡监控卸载模块.
+- `restore-pve-original.sh`: 完整恢复 PVE 原始文件（不依赖 .bak，适合多次运行后备份已被污染的情况）.
+- `add-storcli-monitor.sh`: 旧入口, 已改为转调安装模块, 保留兼容.
+
+> [!IMPORTANT]
+> `pve-manager-status.sh` 的基础安装会重装 `pve-manager` / `pve-i18n`, 这会清掉阵列卡注入.
+> 直接使用 `bash pve-manager-status.sh install` 会自动完成“基础 + 阵列卡”两步；
+> 如果只执行了 `base`, 需要再执行 `bash pve-manager-status.sh storcli-install`.
+
+阵列卡监控的前置条件:
 
 - Proxmox VE 8 / 9 (本 Fork 在 PVE 9.2.31 上实测)
 - LSI / Broadcom MegaRAID 阵列卡 (`megaraid_sas`), 且 `smartctl -a -d megaraid,<DID> /dev/bus/<N>` 能读取物理盘
@@ -82,19 +124,48 @@ wget -O /root/it87-dkms_1.0.63-1_all.deb https://raw.githubusercontent.com/MiKin
 
 ## 阵列卡 SMART 监控（本 Fork 新增）
 
-`add-storcli-monitor.sh` 负责把 MegaRAID 阵列卡下的物理硬盘信息接入 PVE 节点概要页面, 执行内容如下:
+`install-storcli-monitor.sh` 负责把 MegaRAID 阵列卡下的物理硬盘信息接入 PVE 节点概要页面, 采用 **systemd timer + 文件缓存** 架构:
 
 | 项目 | 说明 |
 | --- | --- |
 | 数据读取 | `smartctl -a -d megaraid,<DID> /dev/bus/<N>`, 绕过阵列卡直接读取物理盘 SMART |
 | 解析器 | `/usr/local/bin/pve_storcli_parser.py`, 每块盘输出 12 个字段, 多块盘以双竖线分隔 |
+| 缓存更新器 | `/usr/local/bin/pve_storcli_cache_updater.sh`, 调用解析器并原子写入缓存 |
+| 定时器 | `pve-storcli-cache.timer`, `OnBootSec=1min` + `OnUnitActiveSec=5min` |
 | 权限 | `/etc/sudoers.d/pve-storcli`, 允许 `www-data` 免密执行 `smartctl` 与解析器 |
-| 后端注入 | `Nodes.pm` 中在 `$res->{sata_status}` 后注入 `$res->{storcli_status}` |
+| 后端注入 | `Nodes.pm` 中在 `$res->{sata_status}` 后注入 `$res->{storcli_status}`, 只读取缓存文件 |
 | 前端注入 | `pvemanagerlib.js` 中在 `sata_status` 模块后注入阵列卡渲染模块 |
 | 页面高度 | 读取 Fork 版算出的基础高度, 再按 **51px/块盘** 追加; 5 块盘增加 255px |
-| 结果缓存 | `/var/cache/pve-manager-status/storcli.cache`, 默认 60 秒 TTL |
+| 结果缓存 | `/var/cache/pve-manager/storcli_status.cache`, timer 每 5 分钟刷新 |
 
-脚本结束时会重启 `pvedaemon` 与 `pveproxy`, 并打印本次对应的回滚命令.
+脚本结束时会执行一次初始缓存生成, 启用 `pve-storcli-cache.timer`, 并重启 `pvedaemon` 与 `pveproxy`.
+
+### 定时缓存架构
+
+```text
+systemd timer (每 5 分钟)
+  -> pve_storcli_cache_updater.sh
+  -> pve_storcli_parser.py --refresh
+  -> /var/cache/pve-manager/storcli_status.cache
+  -> Nodes.pm 只读取缓存文件
+  -> pvemanagerlib.js 渲染
+```
+
+PVE 页面请求 `Nodes.pm` 时不再执行 `smartctl`，因此不会因为阵列卡或 SAS 盘唤醒而卡顿。
+
+手动刷新缓存:
+
+```bash
+systemctl start pve-storcli-cache.service
+# 或直接执行
+/usr/local/bin/pve_storcli_cache_updater.sh
+```
+
+查看定时器:
+
+```bash
+systemctl list-timers pve-storcli-cache.timer
+```
 
 解析器字段顺序: `型号|温度|通电时间|坏道|健康状态|无法纠错数|序列号|生产日期|读取GB|写入GB|不安全断电|寿命`
 
@@ -121,36 +192,71 @@ wget -O /root/it87-dkms_1.0.63-1_all.deb https://raw.githubusercontent.com/MiKin
 - `pve-manager-status.sh` 使用 **17px/行 + 2px/模块分隔线** 计算基础高度; 传感器按实际 `Package` 数与每 4 个核心 1 行统计, 避免多路 CPU 少算行数.
 - PVE 9 中 `pveNodeStatus` 的 body 高度 = 面板高度 - 46px (标题栏 + 内边距), 且 body 内部还有 20px 上下 padding; 当前模型额外预留 20px, 让 body 内容区略大于 table, 避免最后一行被裁切.
 - 已修正上游 `sata_status` 按 `lsblk` 统计阵列卡虚拟盘导致的高度冗余: 阵列卡虚拟盘读不到底层 SMART 时只按 1 行提示计算.
-- `add-storcli-monitor.sh` 在基础高度上追加 `硬盘数 * 51px`, 并把基础高度与增量记录在 `/var/lib/pve-manager-status/storcli-height.state`.
+- `install-storcli-monitor.sh` 在基础高度上追加 `硬盘数 * 51px`, 并把基础高度与增量记录在 `/var/lib/pve-manager-status/storcli-height.state`.
 - 重复执行不会重复累加; 重跑主脚本后会以新的基础高度重新计算.
-- 如果浏览器缩放或字体导致仍然留白/溢出, 可调整 `add-storcli-monitor.sh` 顶部的 `disk_height=51`.
+- 如果浏览器缩放或字体导致仍然留白/溢出, 可调整 `install-storcli-monitor.sh` 顶部的 `disk_height=51`.
+- 也可以临时用环境变量覆盖: `PVE_STORCLI_DISK_HEIGHT=44 bash install-storcli-monitor.sh` (默认 51).
 
-### 备份与回滚
+### 一键卸载 / 回滚
 
-脚本修改前会生成:
+安装时会生成:
 
 - `/usr/share/perl5/PVE/API2/Nodes.pm.storcli.bak`
 - `/usr/share/pve-manager/js/pvemanagerlib.js.storcli.bak`
 
-部署结束时会打印本次对应的回滚命令. 也可以手动回滚:
+卸载只需执行:
 
 ```bash
-cp /usr/share/perl5/PVE/API2/Nodes.pm.storcli.bak /usr/share/perl5/PVE/API2/Nodes.pm
-cp /usr/share/pve-manager/js/pvemanagerlib.js.storcli.bak /usr/share/pve-manager/js/pvemanagerlib.js
-rm -f /usr/local/bin/pve_storcli_parser.py /etc/sudoers.d/pve-storcli
-rm -rf /var/cache/pve-manager-status /var/lib/pve-manager-status
-systemctl restart pvedaemon pveproxy
+bash pve-manager-status.sh storcli-uninstall
+# 或直接执行模块
+bash uninstall-storcli-monitor.sh
 ```
 
-> 注意: `pve-manager-status.sh` 重跑时会清理 `*.bak`, 请以 `add-storcli-monitor.sh` 当次执行后生成的备份为准.
+卸载脚本会自动完成:
+
+- 停止并删除 `pve-storcli-cache.timer` / `pve-storcli-cache.service`
+- 删除解析器、缓存更新器、sudoers、缓存文件与高度状态
+- 从 `.storcli.bak` 还原 `Nodes.pm` 与 `pvemanagerlib.js`
+- 备份缺失时, 退化为精确删除注入代码并把页面高度恢复到安装前
+- 重启 `pvedaemon` / `pveproxy`
+
+脚本可重复执行, 不会因为文件已不存在而报错.
+
+> 注意: `pve-manager-status.sh` 重跑时会清理 `*.bak`, 之后重新执行 `install-storcli-monitor.sh` 会生成新的干净备份.
+
+### 完整恢复原始 PVE（多次运行后 .bak 失效时）
+
+早期 `pve-manager-status.sh` 的顺序是“先备份当前文件，再重装软件包”。多次运行后，`.bak` 备份到的是上一次修改后的文件，而不是真正的原始文件，因此无法再靠 `.bak` 回滚。
+
+当前版本已调整为先重装、再备份、最后修改，新生成的 `.bak` 是干净的。对于已经被污染的环境，执行：
+
+```bash
+bash pve-manager-status.sh restore
+# 或非交互
+bash pve-manager-status.sh restore --yes
+```
+
+它会：
+
+- 停止并删除 storcli timer/service、解析器、缓存更新器、sudoers、缓存与高度状态
+- 删除 `/etc/sudoers.d/pve-manager-status`
+- 删除 `/etc/modules-load.d/turbostat-msr.conf`
+- 通过 `apt-get install --reinstall -y pve-manager pve-i18n` 从软件包恢复原始 `Nodes.pm` / `pvemanagerlib.js` / `pve-lang-zh_CN.js`
+- 删除所有旧 `.bak`，避免以后误用被污染的备份
+- 校验是否还有注入残留
+- 重启 `pvedaemon` / `pveproxy`
+
+> 依赖包（sudo/sysstat/lm-sensors/smartmontools/linux-cpupower）、`it87-dkms` 以及 `/etc/modules` 中 sensors-detect 追加的模块不会自动卸载；脚本结束时会提示，需自行确认后处理。
 
 ## 已知问题
 
 - 阵列卡监控目前只针对 LSI / Broadcom MegaRAID (`megaraid_sas`) 验证通过. 其他 RAID/HBA (例如 `-d sat`, `-d scsi`, `-d areca`) 需要自行调整解析器中的 `-d megaraid,<DID>` 读取方式.
-- `51px/块盘` 是在特定浏览器缩放和字体下的实测值. 如果页面仍有留白或内容被截断, 请调整 `add-storcli-monitor.sh` 顶部的 `disk_height`.
+- 安装器会检查 `storcli64`/`storcli` 是否存在, 但实际读取使用 `smartctl`; 未安装 storcli 也可以运行, 只会在安装时给出提示.
+- `51px/块盘` 是在特定浏览器缩放和字体下的实测值. 如果页面仍有留白或内容被截断, 请调整 `install-storcli-monitor.sh` 顶部的 `disk_height`.
+- 阵列卡数据默认最多有 5 分钟缓存延迟; 需要立即刷新时执行 `systemctl start pve-storcli-cache.service`.
 - 上游的直连 SATA 硬盘监控代码未经过完整测试; 本 Fork 的阵列卡物理盘监控走独立的 `storcli_status` 模块, 不依赖该逻辑.
 - nvme 硬盘监控部分对于 I/O 实时读写速度和延迟的实现代码使用目前常见的 iostat -d -x -k 1 1 但这将导致长时间运行后 iostat 进程休眠或被杀死, 你将会看到这部分监控参数"冻结", 在重启前将永远不再刷新, 目前尝试过使用其它方式实现这个功能避免冻结, 但都未能达到预期的效果, 有些实现方式复杂超出预期短期内无法解决, 另外一些能生效的方法则不够优雅, 会导致Web页面自动刷新间隔变得非常长.
-- 执行 `apt upgrade` 升级 `pve-manager` 后, 本项目的 Perl/JS 注入可能被覆盖. 重新执行 `pve-manager-status.sh` 和 `add-storcli-monitor.sh` 即可恢复.
+- 执行 `apt upgrade` 升级 `pve-manager` 后, 本项目的 Perl/JS 注入可能被覆盖. 重新执行 `pve-manager-status.sh` 和 `install-storcli-monitor.sh` 即可恢复.
 
 ## 未来计划
 
