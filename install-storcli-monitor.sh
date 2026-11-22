@@ -32,11 +32,6 @@ systemd_dir="/etc/systemd/system"
 service_file="${systemd_dir}/pve-storcli-cache.service"
 timer_file="${systemd_dir}/pve-storcli-cache.timer"
 
-disk_height="${PVE_STORCLI_DISK_HEIGHT:-51}"
-if ! [[ "$disk_height" =~ ^[0-9]+$ ]]; then
-    disk_height=51
-fi
-
 get_statusview_height() {
     grep -A 40 "Ext.define('PVE.node.StatusView'" "$js_file" \
         | grep -m1 'height:' \
@@ -1170,42 +1165,33 @@ else
 fi
 
 # ==========================================
-# 9. 动态追加阵列卡所需页面高度
+# 9. 设置集群统一页面高度
 # ==========================================
-echo -e "\n🎚️ 正在追加阵列卡监控区域高度:"
+echo -e "\n🎚️ 正在设置集群统一页面高度:"
+
+# 集群共享前端: 不能按本机硬盘数量累加高度, 否则切换节点会遮挡/留白.
+# 默认 1600px, 可用 PVE_MANAGER_STATUS_HEIGHT 在所有节点统一覆盖.
+cluster_height="${PVE_MANAGER_STATUS_HEIGHT:-1600}"
+if ! [[ "$cluster_height" =~ ^[0-9]+$ ]] || [ "$cluster_height" -lt 800 ]; then
+    cluster_height=1600
+fi
 
 current_h=$(get_statusview_height)
-
 if ! [[ "$current_h" =~ ^[0-9]+$ ]]; then
     echo -e "⛔ 无法读取 PVE.node.StatusView 的 height, 跳过高度调整"
 else
-    base_h="$current_h"
-    prev_inc=0
-
-    if [ -f "$state_file" ]; then
-        read -r prev_base prev_inc < "$state_file" || true
-        if [[ "$prev_base" =~ ^[0-9]+$ ]] && [[ "$prev_inc" =~ ^[0-9]+$ ]]; then
-            if [ "$current_h" -eq $((prev_base + prev_inc)) ]; then
-                base_h="$prev_base"
-            fi
-        fi
-    fi
-
-    height_inc=$((disk_count * disk_height))
-    new_height=$((base_h + height_inc))
-
-    if [ "$new_height" -ne "$current_h" ]; then
-        sed -i -E "/Ext[.]define[(]'PVE[.]node[.]StatusView'/,/height:/{s/height: *[0-9]+/height: ${new_height}/;}" "$js_file"
+    if [ "$current_h" -ne "$cluster_height" ]; then
+        sed -i -E "/Ext[.]define[(]'PVE[.]node[.]StatusView'/,/height:/{s/height: *[0-9]+/height: ${cluster_height}/;}" "$js_file"
         applied_h=$(get_statusview_height)
-        if [ "$applied_h" != "$new_height" ]; then
-            echo -e "⛔ 页面高度写入失败 (期望 ${new_height}px, 实际 ${applied_h:-未知}px)"
+        if [ "$applied_h" != "$cluster_height" ]; then
+            echo -e "⛔ 页面高度写入失败 (期望 ${cluster_height}px, 实际 ${applied_h:-未知}px)"
         else
-            echo "$base_h $height_inc" > "$state_file"
-            echo "页面高度: ${current_h}px -> ${new_height}px (基础 ${base_h}px + ${disk_count} 块 * ${disk_height}px) ✅"
+            echo "${cluster_height} 0" > "$state_file"
+            echo "页面高度已统一设置为 ${cluster_height}px (集群模式, 本机 ${disk_count} 块阵列盘) ✅"
         fi
     else
-        echo "$base_h $height_inc" > "$state_file"
-        echo "页面高度已匹配: ${new_height}px (${disk_count} 块 * ${disk_height}px) ➡️"
+        echo "${cluster_height} 0" > "$state_file"
+        echo "页面高度已匹配: ${cluster_height}px (集群统一高度) ➡️"
     fi
 fi
 

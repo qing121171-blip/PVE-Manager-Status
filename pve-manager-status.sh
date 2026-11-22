@@ -1,6 +1,6 @@
 #!/bin/bash
 # pve-manager-status.sh
-# Last Modified: 2026-11-14
+# Last Modified: 2026-11-22 (cluster adaptation)
 #
 # 统一入口脚本:
 #   bash pve-manager-status.sh                交互式菜单 (推荐)
@@ -513,19 +513,28 @@ cat > "$tmpf1" << 'EOF'
         $res->{sensors} = `sudo sensors`;
 EOF
 
-for x in {0..9}; do
-    for dev in "/dev/nvme${x}" "/dev/nvme${x}n1"; do
-        if [ -b "$dev" ]; then
-            cat >> "$tmpf1" << EOF
+cat >> "$tmpf1" << 'EOF'
 
-        my \$nvme${x}_info = \`sudo smartctl -a $dev | grep -E "Model Number|(?=Total|Namespace)[^:]+Capacity|Temperature:|Available Spare:|Percentage|Data Unit|Power Cycles|Power On Hours|Unsafe Shutdowns|Integrity Errors"\`;
-        my \$nvme${x}_io = \`sudo iostat -d -x -k 1 1 | grep -E "^${dev##*/}"\`;
-        \$res->{nvme${x}_status} = \$nvme${x}_info . \$nvme${x}_io;
+        # 集群同构：无论本机是否存在 NVMe，都生成 nvme0..nvme9 的读取代码。
+        # 运行时用 Perl 的 -b 判断设备路径，避免对不存在的设备调用 smartctl。
+        my $iostat_all = `sudo iostat -d -x -k 1 1`;
+        for my $x (0..9) {
+            my $nvme_dev = "";
+            if (-b "/dev/nvme${x}n1") {
+                $nvme_dev = "/dev/nvme${x}n1";
+            } elsif (-b "/dev/nvme$x") {
+                $nvme_dev = "/dev/nvme$x";
+            }
+
+            my $nvme_info = "";
+            if ($nvme_dev) {
+                $nvme_info = `sudo smartctl -a $nvme_dev 2>/dev/null | grep -E "Model Number|(?=Total|Namespace)[^:]+Capacity|Temperature:|Available Spare:|Percentage|Data Unit|Power Cycles|Power On Hours|Unsafe Shutdowns|Integrity Errors"`;
+            }
+
+            my @nvme_io = grep { /^nvme${x}/ } split /\n/, $iostat_all;
+            $res->{"nvme${x}_status"} = $nvme_info . join("\n", @nvme_io);
+        }
 EOF
-            break
-        fi
-    done
-done
 
 cat >> "$tmpf1" << 'EOF'
 
@@ -850,9 +859,7 @@ cat > "$tmpf2" << 'EOF'
 EOF
 
 for x in {0..9}; do
-    for dev in "/dev/nvme${x}" "/dev/nvme${x}n1"; do
-        if [ -b "$dev" ]; then
-            cat >> "$tmpf2" << EOF
+    cat >> "$tmpf2" << EOF
         {
             itemId: 'nvme${x}-status',
             colspan: 2,
@@ -860,6 +867,23 @@ for x in {0..9}; do
             title: gettext('NVMe${x}硬盘'),
             textField: 'nvme${x}_status',
             renderer:function(value){
+                var field = this;
+                var isNvmeField = field && field.itemId === 'nvme${x}-status';
+                var hasData = value && String(value).trim() !== '';
+                try {
+                    if (isNvmeField && field.setHidden) {
+                        field.setHidden(!hasData);
+                    } else if (isNvmeField && field.setVisible) {
+                        field.setVisible(hasData);
+                    }
+                    // 双重保险: 如果 Ext 组件 API 不可用, 直接隐藏对应的表格行
+                    if (isNvmeField && field.el && field.el.dom && field.el.dom.closest) {
+                        var row = field.el.dom.closest('tr');
+                        if (row) {
+                            row.style.display = hasData ? '' : 'none';
+                        }
+                    }
+                } catch (e) {}
                 function getSsdLifeColor(life) {
                     const lifeNum = parseFloat(life);
                     if (lifeNum < 50) return 'var(--pve-manager-status-high)';
@@ -898,7 +922,7 @@ for x in {0..9}; do
                     if (latencyNum < 1) return \`<span style="color:var(--pve-manager-status-low); font-weight:bold;">\${latency}ms</span>\`;
                     return \`<span style="color:var(--pve-manager-status-medium); font-weight:bold;">\${latency}ms</span>\`;
                 }
-                if (value.length > 0) {
+                if (hasData) {
                     value = value.replace(/Â/g, '');
                     let data = [];
                     let nvmeNumber = -1;
@@ -1134,14 +1158,11 @@ for x in {0..9}; do
                     return output;
 
                 } else {
-                    return '提示: 未安装 NVMe硬盘 或已直通 NVMe 控制器!';
+                    return '';
                 }
             },
         },
 EOF
-            break
-        fi
-    done
 done
 
 cat >> "$tmpf2" << 'EOF'
@@ -1473,89 +1494,18 @@ echo && sleep 0.5
 
 ####################   调整页面高度   ####################
 
-echo -e "🎚️ 正在动态调整修改后的页面高度:"
+echo -e "🎚️ 正在设置集群统一页面高度:"
 
-# 基于 PVE 9 实际 DOM 行高: 每行 17px, 每个模块底部 2px 分隔线
-calculate_height_increase() {
-    local total_lines=0
-    local module_count=0
+# 集群共享前端: 高度不能按单机硬件数量计算, 否则切换节点会遮挡或留白.
+# 默认 1600px, 可用 PVE_MANAGER_STATUS_HEIGHT 在所有节点统一覆盖.
+cluster_height="${PVE_MANAGER_STATUS_HEIGHT:-1600}"
+if ! [[ "$cluster_height" =~ ^[0-9]+$ ]] || [ "$cluster_height" -lt 800 ]; then
+    cluster_height=1600
+fi
 
-    # itemId:cpupower(CPU能耗): 固定1行
-    total_lines=$((total_lines + 1))
-    module_count=$((module_count + 1))
-
-    # itemId:cpufreq(CPU频率): 固定1行
-    total_lines=$((total_lines + 1))
-    module_count=$((module_count + 1))
-
-    # itemId:sensors(传感器): 每个 Package 1 行, 每 4 个核心 1 行
-    module_count=$((module_count + 1))
-    local sensor_output=$(sudo sensors 2>/dev/null)
-    local core_temp_count=$(printf '%s\n' "$sensor_output" | grep -c '^Core')
-    local package_count=$(printf '%s\n' "$sensor_output" | grep -cE '^[[:space:]]*(Package id|Tctl)')
-    if [ "$package_count" -lt 1 ]; then
-        package_count=1
-    fi
-    local sensor_lines=$package_count
-    if [ "$core_temp_count" -gt 1 ]; then
-        sensor_lines=$((sensor_lines + (core_temp_count + 3) / 4))
-    fi
-    total_lines=$((total_lines + sensor_lines))
-
-    # itemId:corefreq(核心频率): 无固定行
-    module_count=$((module_count + 1))
-    local thread_count=$(grep -c ^processor /proc/cpuinfo)
-    if [ "$thread_count" -gt 0 ]; then
-        local core_freq_lines=$(((thread_count + 4 - 1) / 4))
-        total_lines=$((total_lines + core_freq_lines))
-    fi
-
-    # itemId:nvme-status(NVMe硬盘): 固定4行每个
-    local nvme_count=$(lsblk -d -o NAME | grep -c 'nvme[0-9]')
-    if [ "$nvme_count" -gt 0 ]; then
-        local nvme_lines=$((nvme_count * 4))
-        total_lines=$((total_lines + nvme_lines))
-        module_count=$((module_count + nvme_count))
-    fi
-
-    # itemId:sata_status(SATA硬盘): 智能判断阵列卡环境
-    module_count=$((module_count + 1))
-    local sata_lsblk_count=$(lsblk -d -o NAME | grep -c 'sd[a-z]')
-    # 运行时直接统计 smartctl 能读出 SMART 信息的物理盘数量.
-    # 不要到 Nodes.pm 里 grep "Device Model": 那条命令的 grep 模式本身就包含该关键字,
-    # 会永远匹配到命令自身, 从而把阵列卡虚拟盘误判成真实盘并多算高度.
-    local sata_real_count=0
-    if [ "$sata_lsblk_count" -gt 0 ] && command -v smartctl >/dev/null 2>&1; then
-        sata_real_count=$(timeout 8s sudo smartctl -a /dev/sd? 2>/dev/null | grep -cE '^[[:space:]]*Device Model:')
-    fi
-
-    if [ "$sata_lsblk_count" -eq 0 ]; then
-        # 无盘, 页面显示1行提示
-        total_lines=$((total_lines + 1))
-    elif [ "$sata_real_count" -eq 0 ]; then
-        # 只有阵列卡虚拟盘 (如 /dev/sda), smartctl 读不到底层盘, 页面仅显示1行提示
-        total_lines=$((total_lines + 1))
-    else
-        # 以实际能读出 SMART 的物理盘为准: 第1块占2行, 后续每块占3行(含1行间距);
-        # 阵列卡环境下的虚拟盘不再计入高度
-        total_lines=$((total_lines + 2 + (sata_real_count - 1) * 3))
-    fi
-
-    # 【核心修复】按 PVE 实际行高 17px、模块分隔线 2px 计算
-    local height_increase=$((total_lines * 17 + module_count * 2))
-    echo $height_increase
-}
-
-# 获取计算出的高度增量
-height_increase=$(calculate_height_increase)
-
-# 基于基础高度(350px)计算新高度
-# PVE 9 的 pveNodeStatus body 还有 15px 上 + 5px 下 padding, 共 20px, 基础高度未包含这部分
-new_height=$((350 + height_increase + 20))
-
-# 使用 sed 命令定位并更新 PVE.node.StatusView 的 height 属性
-sed -i -E "/Ext[.]define[(]'PVE[.]node[.]StatusView'/,/height:/{s/height: *[0-9]+/height: $new_height/;}" "$pvemanagerlib"
-echo "页面高度经计算模型已动态调整为 ${new_height}px ✅"
+sed -i -E "/Ext[.]define[(]'PVE[.]node[.]StatusView'/,/height:/{s/height: *[0-9]+/height: ${cluster_height}/;}" "$pvemanagerlib"
+echo "页面高度已统一设置为 ${cluster_height}px ✅"
+echo -e "⚠️ 集群模式下所有节点使用同一高度; 如硬件更多, 请在所有节点设置 PVE_MANAGER_STATUS_HEIGHT"
 
 echo && sleep 0.5
 

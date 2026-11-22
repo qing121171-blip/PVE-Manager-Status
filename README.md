@@ -32,7 +32,7 @@ PVE-Manager-Status 是一款强大的开源脚本工具, 通过实时基于动�
 - 支持识别多块 NVMe 硬盘, 并根据寿命和压力负载显示动态色彩指标.
 - 完善 zh-CN 本地化, 修复中文环境下缺失的部分翻译.
 - **[本 Fork] 支持 LSI / Broadcom MegaRAID 阵列卡物理硬盘 SMART 监控**, 可显示型号、温度、通电时间、坏道、健康状态、无法纠错数、序列号、生产日期、累计读写量、SSD 寿命与不安全断电次数.
-- **[本 Fork] 节点概要页面高度动态计算**: 基础内容按 PVE 实际行高 17px + 2px/模块分隔线计算, 传感器按 Package 数与核心数统计; 阵列卡硬盘按 51px/块追加; 重复执行不会重复累加.
+- **[本 Fork] 集群同构 + 统一高度**: NVMe 强制生成 nvme0..nvme9 模块, 空数据自动隐藏; 集群页面高度统一为 1600px (可用 `PVE_MANAGER_STATUS_HEIGHT` 覆盖), 不再按单机硬件数量计算.
 - **[本 Fork] systemd timer 每 5 分钟后台刷新阵列卡 SMART 缓存**, PVE 页面只读取缓存文件, 页面请求中不执行任何 smartctl/耗时命令.
 
 ## 如何使用
@@ -140,7 +140,7 @@ wget -O /root/it87-dkms_1.0.63-1_all.deb https://raw.githubusercontent.com/MiKin
 | 权限 | `/etc/sudoers.d/pve-storcli`, 允许 `www-data` 免密执行 `smartctl` 与解析器 |
 | 后端注入 | `Nodes.pm` 中在 `$res->{sata_status}` 后注入 `$res->{storcli_status}`, 只读取缓存文件 |
 | 前端注入 | `pvemanagerlib.js` 中在 `sata_status` 模块后注入阵列卡渲染模块 |
-| 页面高度 | 读取 Fork 版算出的基础高度, 再按 **51px/块盘** 追加; 5 块盘增加 255px |
+| 页面高度 | 集群统一 **1600px**, 可用 `PVE_MANAGER_STATUS_HEIGHT` 覆盖; 不再按本机硬盘数量累加 |
 | 结果缓存 | `/var/cache/pve-manager/storcli_status.cache`, timer 每 5 分钟刷新 |
 
 脚本结束时会执行一次初始缓存生成, 启用 `pve-storcli-cache.timer`, 并重启 `pvedaemon` 与 `pveproxy`.
@@ -192,15 +192,33 @@ systemctl list-timers pve-storcli-cache.timer
 - SSD 寿命取自 SMART 属性的归一化 VALUE 列 (例如 Intel `Media_Wearout_Indicator` 的 `099` 显示为 `99%`); 不安全断电次数取自 `Unsafe_Shutdown_Count` 的 RAW_VALUE.
 - 解析器会强制以英文 locale 读取 `smartctl` 输出, 避免中文环境下的字段匹配失败.
 
+### 集群部署（多节点）
+
+PVE 集群的 Web 前端是共享的，切换节点时使用的是同一份 `pvemanagerlib.js`，所以**每台节点都必须安装**，并且生成的结构必须一致。
+
+在 `pve05`、`pve08` 等所有节点分别执行：
+
+```bash
+bash pve-manager-status.sh install --yes
+```
+
+关键点：
+
+- `Nodes.pm` 强制生成 `nvme0..nvme9` 的读取代码，不再按 `if [ -b /dev/nvmeX ]` 裁剪结构
+- `pvemanagerlib.js` 强制生成 `nvme0..nvme9` 的前端模块；没有数据的模块在 renderer 中调用 `setHidden(true)` 自动隐藏
+- SATA 读取与阵列卡缓存逻辑在所有节点保持一致
+- 阵列卡缓存固定在本机 `/var/cache/pve-manager/storcli_status.cache`，不要放到集群共享存储
+- 页面高度统一使用 `1600px`，避免切换节点时遮挡或留白
+- 例如 `pve08` 只有 NVMe0、`pve05` 有 NVMe1，前后端都固定包含 `nvme0..nvme9`，因此切到 `pve05` 时 NVMe1 不会再丢失
+
 ### 高度说明
 
-- `pve-manager-status.sh` 使用 **17px/行 + 2px/模块分隔线** 计算基础高度; 传感器按实际 `Package` 数与每 4 个核心 1 行统计, 避免多路 CPU 少算行数.
-- PVE 9 中 `pveNodeStatus` 的 body 高度 = 面板高度 - 46px (标题栏 + 内边距), 且 body 内部还有 20px 上下 padding; 当前模型额外预留 20px, 让 body 内容区略大于 table, 避免最后一行被裁切.
-- 已修正上游 `sata_status` 按 `lsblk` 统计阵列卡虚拟盘导致的高度冗余: 阵列卡虚拟盘读不到底层 SMART 时只按 1 行提示计算.
-- `install-storcli-monitor.sh` 在基础高度上追加 `硬盘数 * 51px`, 并把基础高度与增量记录在 `/var/lib/pve-manager-status/storcli-height.state`.
-- 重复执行不会重复累加; 重跑主脚本后会以新的基础高度重新计算.
-- 如果浏览器缩放或字体导致仍然留白/溢出, 可调整 `install-storcli-monitor.sh` 顶部的 `disk_height=51`.
-- 也可以临时用环境变量覆盖: `PVE_STORCLI_DISK_HEIGHT=44 bash install-storcli-monitor.sh` (默认 51).
+- PVE 集群的 Web 前端由所有节点共享, 因此高度不再按单机硬件数量计算.
+- `pve-manager-status.sh` 与 `install-storcli-monitor.sh` 统一把 `PVE.node.StatusView` 的 `height` 设置为 **1600px**.
+- 可用 `PVE_MANAGER_STATUS_HEIGHT` 在所有节点统一覆盖, 例如 `2000`.
+- NVMe 固定生成 `nvme0..nvme9` 模块, 没有数据的模块通过 `setHidden(true)` 隐藏; 因此同一份前端可以适配不同节点.
+- 重复执行只会把高度覆盖为同一个集群高度, 不会累加.
+- 如硬件数量超过默认高度, 在所有节点统一设置更大的值, 例如: `PVE_MANAGER_STATUS_HEIGHT=2000 bash pve-manager-status.sh install --yes`.
 
 ### 一键卸载 / 回滚
 
@@ -282,7 +300,7 @@ bash pve-manager-status.sh repo-fix
 
 - 阵列卡监控目前只针对 LSI / Broadcom MegaRAID (`megaraid_sas`) 验证通过. 其他 RAID/HBA (例如 `-d sat`, `-d scsi`, `-d areca`) 需要自行调整解析器中的 `-d megaraid,<DID>` 读取方式.
 - 安装器会检查 `storcli64`/`storcli` 是否存在, 但实际读取使用 `smartctl`; 未安装 storcli 也可以运行, 只会在安装时给出提示.
-- `51px/块盘` 是在特定浏览器缩放和字体下的实测值. 如果页面仍有留白或内容被截断, 请调整 `install-storcli-monitor.sh` 顶部的 `disk_height`.
+- 默认 1600px 是集群统一高度; 如果某节点硬件更多导致截断, 请在所有节点统一提高 `PVE_MANAGER_STATUS_HEIGHT`. 硬件较少的节点会留白, 这是集群共享前端的取舍.
 - 阵列卡数据默认最多有 5 分钟缓存延迟; 需要立即刷新时执行 `systemctl start pve-storcli-cache.service`.
 - 上游的直连 SATA 硬盘监控代码未经过完整测试; 本 Fork 的阵列卡物理盘监控走独立的 `storcli_status` 模块, 不依赖该逻辑.
 - nvme 硬盘监控部分对于 I/O 实时读写速度和延迟的实现代码使用目前常见的 iostat -d -x -k 1 1 但这将导致长时间运行后 iostat 进程休眠或被杀死, 你将会看到这部分监控参数"冻结", 在重启前将永远不再刷新, 目前尝试过使用其它方式实现这个功能避免冻结, 但都未能达到预期的效果, 有些实现方式复杂超出预期短期内无法解决, 另外一些能生效的方法则不够优雅, 会导致Web页面自动刷新间隔变得非常长.
