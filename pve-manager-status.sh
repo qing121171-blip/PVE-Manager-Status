@@ -1267,13 +1267,6 @@ for x in {0..9}; do
                     } else if (isNvmeField && field.setVisible) {
                         field.setVisible(hasData);
                     }
-                    // 双重保险: 如果 Ext 组件 API 不可用, 直接隐藏对应的表格行
-                    if (isNvmeField && field.el && field.el.dom && field.el.dom.closest) {
-                        var row = field.el.dom.closest('tr');
-                        if (row) {
-                            row.style.display = hasData ? '' : 'none';
-                        }
-                    }
                 } catch (e) {}
                 function getSsdLifeColor(life) {
                     const lifeNum = parseFloat(life);
