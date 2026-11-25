@@ -919,11 +919,29 @@ cat >> "$tmpf1" << 'EOF'
 
             my $nvme_info = "";
             if ($nvme_dev) {
-                $nvme_info = `sudo smartctl -a $nvme_dev 2>/dev/null | grep -E "Model Number|(?=Total|Namespace)[^:]+Capacity|Temperature:|Available Spare:|Percentage|Data Unit|Power Cycles|Power On Hours|Unsafe Shutdowns|Integrity Errors"`;
+                $nvme_info = `sudo smartctl -a $nvme_dev 2>/dev/null | grep -E "Model Number|Serial Number|Firmware Version|NVMe Version|(?=Total|Namespace)[^:]+Capacity|Temperature:|Available Spare:|Percentage|Data Unit|Power Cycles|Power On Hours|Unsafe Shutdowns|Integrity Errors"`;
+            }
+
+            # 读取 PCIe 链路速率/宽度（sysfs，www-data 可读）
+            my $nvme_pcie = "";
+            my $speed = "";
+            my $width = "";
+            if (open my $speed_fh, '<', "/sys/class/nvme/nvme${x}/device/current_link_speed") {
+                $speed = <$speed_fh>;
+                close $speed_fh;
+                chomp $speed;
+            }
+            if (open my $width_fh, '<', "/sys/class/nvme/nvme${x}/device/current_link_width") {
+                $width = <$width_fh>;
+                close $width_fh;
+                chomp $width;
+            }
+            if ($speed ne "" && $width ne "") {
+                $nvme_pcie = "PCIe Link: $speed x$width\n";
             }
 
             my @nvme_io = grep { /^nvme${x}/ } split /\n/, $iostat_all;
-            $res->{"nvme${x}_status"} = $nvme_info . join("\n", @nvme_io);
+            $res->{"nvme${x}_status"} = $nvme_info . $nvme_pcie . join("\n", @nvme_io);
         }
 EOF
 
@@ -1276,7 +1294,7 @@ for x in {0..9}; do
                 }
                 function colorizeSsdModel(model, life) {
                     const color = getSsdLifeColor(life);
-                    return \`<span style="color:\${color}; font-weight:bold;">\${model}</span>\`;
+                    return \`型号: <span style="color:\${color}; font-weight:bold;">\${model}</span>\`;
                 }
                 function colorizeSsdLife(life) {
                     const color = getSsdLifeColor(life);
@@ -1318,6 +1336,10 @@ for x in {0..9}; do
                             nvmeNumber++; 
                             data[nvmeNumber] = {
                                 Models: [],
+                                PCIe_Links: [],
+                                NVMe_Versions: [],
+                                Serials: [],
+                                Firmwares: [],
                                 Integrity_Errors: [],
                                 Capacitys: [],
                                 Temperatures: [],
@@ -1342,6 +1364,26 @@ for x in {0..9}; do
                         let Models = nvme[1].matchAll(/^Model Number: *([ \S]*)$/gm);
                         for (const Model of Models) {
                             data[nvmeNumber]['Models'].push(Model[1]);
+                        }
+
+                        let PCIe_Links = nvme[1].matchAll(/^PCIe Link: *(.*)$/gm);
+                        for (const PCIe_Link of PCIe_Links) {
+                            data[nvmeNumber]['PCIe_Links'].push(PCIe_Link[1].trim());
+                        }
+
+                        let NVMe_Versions = nvme[1].matchAll(/^NVMe Version: *(.*)$/gm);
+                        for (const NVMe_Version of NVMe_Versions) {
+                            data[nvmeNumber]['NVMe_Versions'].push(NVMe_Version[1].trim());
+                        }
+
+                        let Serials = nvme[1].matchAll(/^Serial Number: *(.*)$/gm);
+                        for (const Serial of Serials) {
+                            data[nvmeNumber]['Serials'].push(Serial[1].trim());
+                        }
+
+                        let Firmwares = nvme[1].matchAll(/^Firmware Version: *(.*)$/gm);
+                        for (const Firmware of Firmwares) {
+                            data[nvmeNumber]['Firmwares'].push(Firmware[1].trim());
                         }
 
                         let Integrity_Errors = nvme[1].matchAll(/^Media and Data Integrity Errors: *([ \S]*)$/gm);
@@ -1411,6 +1453,11 @@ for x in {0..9}; do
                     let output = '';
                     for (const [i, nvme] of data.entries()) {
                         if (i > 0) output += '<br><br>';
+                        const appendLine = (text) => {
+                            if (!text) return;
+                            if (!output.endsWith('<br>')) output += '<br>';
+                            output += text;
+                        };
 
                         if (nvme.Models.length > 0) {
                             output += colorizeSsdModel(nvme.Models[0], 100 - Number(nvme.Useds[0]));
@@ -1517,26 +1564,44 @@ for x in {0..9}; do
                             }
                         }
 
+                        const powerInfo = [];
                         if (nvme.Cycles.length > 0) {
-                            output += '<br>';
-                            for (const nvmeCycle of nvme.Cycles) {
-                                output += \`通电: \${nvmeCycle.replace(/ |,/gm, '')}次\`;
-                            }
+                            powerInfo.push(\`通电: \${nvme.Cycles[0].replace(/ |,/gm, '')}次\`);
+                        }
+                        if (nvme.Shutdowns.length > 0) {
+                            powerInfo.push(\`不安全断电: \${nvme.Shutdowns[0].replace(/ |,/gm, '')}次\`);
+                        }
+                        if (nvme.Hours.length > 0) {
+                            powerInfo.push(\`累计: \${nvme.Hours[0].replace(/ |,/gm, '')}小时\`);
+                        }
+                        if (powerInfo.length > 0) {
+                            appendLine(powerInfo.join(' | '));
+                        }
 
-                            if (nvme.Shutdowns.length > 0) {
-                                output += ', ';
-                                for (const nvmeShutdown of nvme.Shutdowns) {
-                                    output += \`不安全断电\${nvmeShutdown.replace(/ |,/gm, '')}次\`;
-                                    break
-                                }
-                            }
+                        const identityInfo = [];
+                        if (nvme.Serials.length > 0) {
+                            identityInfo.push(\`序列号: \${nvme.Serials[0]}\`);
+                        }
+                        if (nvme.Firmwares.length > 0) {
+                            identityInfo.push(\`固件版本: \${nvme.Firmwares[0]}\`);
+                        }
+                        if (identityInfo.length > 0) {
+                            appendLine(identityInfo.join(' | '));
+                        }
 
-                            if (nvme.Hours.length > 0) {
-                                output += ', ';
-                                for (const nvmeHour of nvme.Hours) {
-                                    output += \`累计\${nvmeHour.replace(/ |,/gm, '')}小时\`;
-                                }
-                            }
+                        const linkInfo = [];
+                        if (nvme.NVMe_Versions.length > 0) {
+                            linkInfo.push(\`NVMe版本: \${nvme.NVMe_Versions[0]}\`);
+                        }
+                        if (nvme.PCIe_Links.length > 0) {
+                            const pcie = nvme.PCIe_Links[0];
+                            const match = pcie.match(/^([\d.]+) GT\/s PCIe x(\d+)$/);
+                            const generations = {'2.5': '1.0', '5': '2.0', '8': '3.0', '16': '4.0', '32': '5.0', '64': '6.0'};
+                            const gen = match ? generations[parseFloat(match[1])] : null;
+                            linkInfo.push(gen ? \`连接速率: PCIe \${gen} x\${match[2]}\` : \`连接速率: \${pcie}\`);
+                        }
+                        if (linkInfo.length > 0) {
+                            appendLine(linkInfo.join(' | '));
                         }
                     }
                     return output;
@@ -1673,9 +1738,9 @@ cat >> "$pvemanagerlib" << 'EOF'
     if (darkTheme && !darkTheme.disabled) {
         const darkColors = `
             :root {
-                --pve-manager-status-low: #167d3f;
-                --pve-manager-status-medium: #edb34b;
-                --pve-manager-status-high: #ce3c3c;
+                --pve-manager-status-low: #3A7D6A;
+                --pve-manager-status-medium: #C28B2C;
+                --pve-manager-status-high: #C45B5B;
             }
         `;
         style.textContent += darkTheme.media
