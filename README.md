@@ -36,6 +36,7 @@ PVE-Manager-Status 是一款强大的开源脚本工具, 通过实时基于动�
 - **[本 Fork] 基础信息内置 SATA/SAS 直连硬盘 SMART 监控**, 与 NVMe 一起显示, 无需额外菜单或安装器.
 - **[本 Fork] 集群同构 + 自动高度**: NVMe 强制生成 nvme0..nvme9 模块, 空数据自动隐藏; 前端按当前节点实际内容自动调整概要面板高度, 无法生效时回退到 1600px (可用 `PVE_MANAGER_STATUS_HEIGHT` 覆盖).
 - **[本 Fork] systemd timer 每 5 分钟后台刷新阵列卡 SMART 缓存**, PVE 页面只读取缓存文件, 页面请求中不执行任何 smartctl/耗时命令.
+- **[本 Fork] 可选移除登录后的“无有效订阅”弹窗**, 只修改前端提示，不绕过订阅校验，可随时恢复.
 
 ## 如何使用
 
@@ -50,6 +51,7 @@ PVE-Manager-Status 是一款强大的开源脚本工具, 通过实时基于动�
 6) 查看当前状态
 7) 立即刷新阵列卡缓存
 8) 移除 PVE 企业订阅源 (修复 apt update)
+9) 移除登录订阅弹窗 (实验性)
 0) 退出
 ```
 
@@ -84,6 +86,8 @@ bash pve-manager-status.sh update-cache     # 立即刷新阵列卡缓存
 bash pve-manager-status.sh storcli-uninstall # 只卸载阵列卡监控
 bash pve-manager-status.sh restore          # 完整恢复 PVE 原始状态
 bash pve-manager-status.sh repo-fix         # 移除企业订阅源, 修复 apt update 401
+bash pve-manager-status.sh nag-fix          # 移除登录后的“无有效订阅”弹窗
+bash pve-manager-status.sh nag-restore      # 恢复登录订阅弹窗
 bash pve-manager-status.sh help             # 查看帮助
 ```
 
@@ -96,6 +100,7 @@ bash pve-manager-status.sh help             # 查看帮助
 - `uninstall-storcli-monitor.sh`: 阵列卡监控卸载模块.
 - `restore-pve-original.sh`: 完整恢复 PVE 原始文件（不依赖 .bak，适合多次运行后备份已被污染的情况）.
 - `remove-pve-enterprise-repo.sh`: 移除 PVE 企业订阅源，修复未订阅环境下 `apt-get update` 的 401 错误.
+- `remove-subscription-nag.sh`: 可选移除登录后的“无有效订阅”弹窗，支持 `--restore` 恢复.
 - `add-storcli-monitor.sh`: 旧入口, 已改为转调安装模块, 保留兼容.
 
 > [!IMPORTANT]
@@ -355,6 +360,40 @@ bash pve-manager-status.sh repo-fix
 
 备份目录：`/var/backups/pve-manager-status/apt-enterprise-<时间戳>/`
 
+### 移除登录订阅弹窗（实验性）
+
+未购买订阅时，PVE 登录后会显示“无有效订阅”弹窗。它只是前端提示，不影响系统运行。
+
+执行：
+
+```bash
+bash pve-manager-status.sh nag-fix
+```
+
+或在交互式菜单选择 `9`。
+
+脚本会：
+
+- 备份 `/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js`
+- 只把带 `No valid subscription` 标题的那一个 `Ext.Msg.show(...)` 改为 `void(...)`
+- 重启 `pveproxy`
+- 浏览器需 **Ctrl + Shift + R** 强刷
+
+恢复：
+
+```bash
+bash pve-manager-status.sh nag-restore
+```
+
+或：
+
+```bash
+bash remove-subscription-nag.sh --restore
+```
+
+> 这是实验性修改。`pve-manager` / `proxmox-widget-toolkit` 升级后可能被覆盖，需要重新执行 `nag-fix`。
+> 它只隐藏登录提示，不会启用企业源，也不会绕过订阅校验。
+
 ## 已知问题
 
 - 阵列卡监控目前只针对 LSI / Broadcom MegaRAID (`megaraid_sas`) 验证通过. 其他 RAID/HBA (例如 `-d sat`, `-d scsi`, `-d areca`) 需要自行调整解析器中的 `-d megaraid,<DID>` 读取方式.
@@ -365,6 +404,7 @@ bash pve-manager-status.sh repo-fix
 - SATA 解析结果默认缓存 300 秒（5 分钟），页面请求不会每次都执行 smartctl；如需调整，修改 `/usr/local/bin/pve_sata_parser.py` 中的 `TTL` 默认值.
 - nvme 硬盘监控部分对于 I/O 实时读写速度和延迟的实现代码使用目前常见的 iostat -d -x -k 1 1 但这将导致长时间运行后 iostat 进程休眠或被杀死, 你将会看到这部分监控参数"冻结", 在重启前将永远不再刷新, 目前尝试过使用其它方式实现这个功能避免冻结, 但都未能达到预期的效果, 有些实现方式复杂超出预期短期内无法解决, 另外一些能生效的方法则不够优雅, 会导致Web页面自动刷新间隔变得非常长.
 - 执行 `apt upgrade` 升级 `pve-manager` 后, 本项目的 Perl/JS 注入可能被覆盖. 重新执行 `pve-manager-status.sh` 和 `install-storcli-monitor.sh` 即可恢复.
+- 登录订阅弹窗移除是实验性功能; `proxmox-widget-toolkit` 升级后可能被覆盖，需要重新执行 `nag-fix`.
 
 ## 未来计划
 

@@ -19,6 +19,9 @@
 
 set -u
 
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+nag_script="${script_dir}/remove-subscription-nag.sh"
+
 nodes_file="${PVE_NODES_PM:-/usr/share/perl5/PVE/API2/Nodes.pm}"
 js_file="${PVE_PVEMANAGERLIB:-/usr/share/pve-manager/js/pvemanagerlib.js}"
 i18n_file="${PVE_I18N_CN:-/usr/share/pve-i18n/pve-lang-zh_CN.js}"
@@ -157,7 +160,13 @@ else
 fi
 
 # ==========================================
-# 7. 重启服务
+# 7. 恢复登录订阅弹窗
+if [ -f "$nag_script" ]; then
+    echo -e "\n🪟 正在恢复登录订阅弹窗:"
+    PVE_NAG_RESTART=0 bash "$nag_script" --restore || true
+fi
+
+# 8. 重启服务
 # ==========================================
 echo -e "\n🔁 正在重启 pvedaemon / pveproxy:"
 

@@ -12,6 +12,7 @@
 #   bash pve-manager-status.sh status
 #   bash pve-manager-status.sh restore
 #   bash pve-manager-status.sh repo-fix       移除 PVE 企业订阅源
+#   bash pve-manager-status.sh nag-fix        移除登录订阅弹窗
 #
 # 内部实现仍拆分为独立模块, 便于维护; 日常使用只需记住本入口。
 
@@ -30,6 +31,8 @@ usage() {
   status               查看安装/缓存/定时器状态
   restore              完整恢复 PVE 原始状态 (清除所有修改)
   repo-fix             移除 PVE 企业订阅源, 修复 apt update 401
+  nag-fix              移除登录后的“无有效订阅”弹窗 (实验性)
+  nag-restore          恢复登录订阅弹窗
   help                 显示本帮助
 
 示例:
@@ -66,10 +69,11 @@ interactive_menu() {
   6) 查看当前状态
   7) 立即刷新阵列卡缓存
   8) 移除 PVE 企业订阅源 (修复 apt update)
+  9) 移除登录订阅弹窗 (实验性)
   0) 退出
 ============================================================
 EOF
-        read -r -p "请输入选项 [0-8]: " choice || exit 1
+        read -r -p "请输入选项 [0-9]: " choice || exit 1
         case "$choice" in
             1) exec bash "$0" install --yes ;;
             2) exec bash "$0" base --yes ;;
@@ -79,6 +83,7 @@ EOF
             6) exec bash "$0" status ;;
             7) exec bash "$0" update-cache ;;
             8) exec bash "$0" repo-fix ;;
+            9) exec bash "$0" nag-fix ;;
             0) echo -e "\n👋 已退出"; exit 0 ;;
             *) echo -e "⚠️ 无效选项, 请重新输入." ;;
         esac
@@ -131,6 +136,14 @@ case "${1:-}" in
     repo-fix|remove-enterprise|enterprise-repo)
         shift
         run_component "${SCRIPT_DIR}/remove-pve-enterprise-repo.sh" "$@"
+        ;;
+    nag-fix|remove-nag|subscription-nag)
+        shift
+        run_component "${SCRIPT_DIR}/remove-subscription-nag.sh" "$@"
+        ;;
+    nag-restore|restore-nag)
+        shift
+        run_component "${SCRIPT_DIR}/remove-subscription-nag.sh" --restore "$@"
         ;;
     update-cache|refresh-cache)
         if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/pve-storcli-cache.service ]; then
