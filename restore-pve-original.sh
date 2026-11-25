@@ -24,11 +24,14 @@ js_file="${PVE_PVEMANAGERLIB:-/usr/share/pve-manager/js/pvemanagerlib.js}"
 i18n_file="${PVE_I18N_CN:-/usr/share/pve-i18n/pve-lang-zh_CN.js}"
 
 parser_file="/usr/local/bin/pve_storcli_parser.py"
+sata_parser_file="/usr/local/bin/pve_sata_parser.py"
 updater_file="/usr/local/bin/pve_storcli_cache_updater.sh"
 storcli_sudoers="/etc/sudoers.d/pve-storcli"
 base_sudoers="/etc/sudoers.d/pve-manager-status"
 cache_dir="/var/cache/pve-manager"
 cache_file="${cache_dir}/storcli_status.cache"
+sata_cache_file="${cache_dir}/sata.cache"
+sata_lock_file="${cache_dir}/sata.lock"
 legacy_cache_dir="/var/cache/pve-manager-status"
 state_dir="/var/lib/pve-manager-status"
 systemd_dir="/etc/systemd/system"
@@ -79,7 +82,7 @@ echo "已移除 pve-storcli-cache.timer / service ✅"
 # ==========================================
 echo -e "\n🧹 正在清理阵列卡监控自定义文件:"
 
-for file in "$parser_file" "$updater_file" "$storcli_sudoers" "$cache_file"; do
+for file in "$parser_file" "$sata_parser_file" "$updater_file" "$storcli_sudoers" "$cache_file" "$sata_cache_file" "$sata_lock_file"; do
     if [ -e "$file" ]; then
         rm -f "$file" && echo "已删除: $file ✅"
     fi

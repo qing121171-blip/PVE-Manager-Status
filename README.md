@@ -32,7 +32,8 @@ PVE-Manager-Status 是一款强大的开源脚本工具, 通过实时基于动�
 - 支持识别多块 NVMe 硬盘, 并根据寿命和压力负载显示动态色彩指标.
 - 完善 zh-CN 本地化, 修复中文环境下缺失的部分翻译.
 - **[本 Fork] 支持 LSI / Broadcom MegaRAID 阵列卡物理硬盘 SMART 监控**, 可显示型号、温度、通电时间、坏道、健康状态、无法纠错数、序列号、生产日期、累计读写量、SSD 寿命与不安全断电次数.
-- **[本 Fork] 集群同构 + 统一高度**: NVMe 强制生成 nvme0..nvme9 模块, 空数据自动隐藏; 集群页面高度统一为 1600px (可用 `PVE_MANAGER_STATUS_HEIGHT` 覆盖), 不再按单机硬件数量计算.
+- **[本 Fork] 基础信息内置 SATA/SAS 直连硬盘 SMART 监控**, 与 NVMe 一起显示, 无需额外菜单或安装器.
+- **[本 Fork] 集群同构 + 自动高度**: NVMe 强制生成 nvme0..nvme9 模块, 空数据自动隐藏; 前端按当前节点实际内容自动调整概要面板高度, 无法生效时回退到 1600px (可用 `PVE_MANAGER_STATUS_HEIGHT` 覆盖).
 - **[本 Fork] systemd timer 每 5 分钟后台刷新阵列卡 SMART 缓存**, PVE 页面只读取缓存文件, 页面请求中不执行任何 smartctl/耗时命令.
 
 ## 如何使用
@@ -127,6 +128,40 @@ wget -O /root/it87-dkms_1.0.63-1_all.deb https://raw.githubusercontent.com/MiKin
 
 安装完成后, 重启系统并再次检查风扇转速信息.
 
+## SATA/SAS 直连硬盘（基础信息内置）
+
+SATA/SAS 直连盘不需要单独的安装器或菜单，`pve-manager-status.sh` 会在基础监控中一并安装：
+
+- 解析器：`/usr/local/bin/pve_sata_parser.py`
+- 缓存：`/var/cache/pve-manager/sata.cache`，默认 300 秒（5 分钟）
+- 后端：`Nodes.pm` 的 `$res->{sata_status}` 读取解析器
+- 前端：基础信息中的「SATA硬盘」模块
+
+解析器会枚举 `/dev/sd[a-z]`，跳过 `sr0` 光驱和分区，对每块盘执行：
+
+```bash
+smartctl -a /dev/sdX
+```
+
+无法识别时自动回退到：
+
+```bash
+smartctl -a -d sat /dev/sdX
+```
+
+显示字段：
+
+- 型号、温度、通电时间、健康状态
+- 坏道（Reallocated + Pending）
+- 无法纠错（Reported_Uncorrect + Offline_Uncorrectable）
+- SN、生产日期、累计读写量
+- SSD 寿命（Wear_Leveling_Count / Media_Wearout_Indicator）
+- 不安全断电次数
+
+没有 SATA 盘的节点会显示一行提示，不影响 NVMe / 阵列卡模块。
+
+> 如果 SATA 控制器是整卡 PCIe 直通给虚拟机，PVE 宿主机看不到这些盘，只能在虚拟机内用 `smartd` 或 Scrutiny 监控。
+
 ## 阵列卡 SMART 监控（本 Fork 新增）
 
 `install-storcli-monitor.sh` 负责把 MegaRAID 阵列卡下的物理硬盘信息接入 PVE 节点概要页面, 采用 **systemd timer + 文件缓存** 架构:
@@ -208,17 +243,40 @@ bash pve-manager-status.sh install --yes
 - `pvemanagerlib.js` 强制生成 `nvme0..nvme9` 的前端模块；没有数据的模块在 renderer 中调用 `setHidden(true)` 自动隐藏
 - SATA 读取与阵列卡缓存逻辑在所有节点保持一致
 - 阵列卡缓存固定在本机 `/var/cache/pve-manager/storcli_status.cache`，不要放到集群共享存储
-- 页面高度统一使用 `1600px`，避免切换节点时遮挡或留白
+- 页面高度优先由前端自动调整；自动高度不可用时回退到 `1600px`
 - 例如 `pve08` 只有 NVMe0、`pve05` 有 NVMe1，前后端都固定包含 `nvme0..nvme9`，因此切到 `pve05` 时 NVMe1 不会再丢失
 
 ### 高度说明
 
-- PVE 集群的 Web 前端由所有节点共享, 因此高度不再按单机硬件数量计算.
-- `pve-manager-status.sh` 与 `install-storcli-monitor.sh` 统一把 `PVE.node.StatusView` 的 `height` 设置为 **1600px**.
-- 可用 `PVE_MANAGER_STATUS_HEIGHT` 在所有节点统一覆盖, 例如 `2000`.
-- NVMe 固定生成 `nvme0..nvme9` 模块, 没有数据的模块通过 `setHidden(true)` 隐藏; 因此同一份前端可以适配不同节点.
-- 重复执行只会把高度覆盖为同一个集群高度, 不会累加.
-- 如硬件数量超过默认高度, 在所有节点统一设置更大的值, 例如: `PVE_MANAGER_STATUS_HEIGHT=2000 bash pve-manager-status.sh install --yes`.
+- PVE 集群的 Web 前端由所有节点共享, 因此高度不能按单机硬件数量写死.
+- `pve-manager-status.sh` 与 `install-storcli-monitor.sh` 仍把 `PVE.node.StatusView` 的 `height` 设置为 **1600px**, 作为初始值和自动高度失败时的回退值.
+- 基础脚本会注入自动高度逻辑: 在 `updateTitle` / `updateValues` 后测量当前 StatusView 的实际表格高度, 加上标题栏和 body padding, 调用 `setHeight` 调整面板.
+- 自动高度会跟随节点切换、NVMe 空模块隐藏、SATA/阵列卡数据加载和表格尺寸变化 (ResizeObserver).
+- 可用 `PVE_MANAGER_STATUS_HEIGHT` 覆盖回退高度, 例如 `1700`.
+- 如果自动高度在某些浏览器/PVE 版本上表现不稳定, 可在浏览器控制台关闭:
+
+```js
+localStorage.setItem('pve-manager-status-auto-height', '0');
+location.reload();
+```
+
+恢复自动高度:
+
+```js
+localStorage.removeItem('pve-manager-status-auto-height');
+location.reload();
+```
+
+关闭后就会使用固定回退高度 (默认 1600px).
+
+需要排查自动高度时，可以在浏览器控制台开启调试日志:
+
+```js
+localStorage.setItem('pve-manager-status-auto-height-debug', '1');
+location.reload();
+```
+
+然后在 Console 里查看 `[pve-manager-status height]`，会输出当前高度、目标高度、表格高度、标题栏高度和 padding。
 
 ### 一键卸载 / 回滚
 
@@ -300,9 +358,10 @@ bash pve-manager-status.sh repo-fix
 
 - 阵列卡监控目前只针对 LSI / Broadcom MegaRAID (`megaraid_sas`) 验证通过. 其他 RAID/HBA (例如 `-d sat`, `-d scsi`, `-d areca`) 需要自行调整解析器中的 `-d megaraid,<DID>` 读取方式.
 - 安装器会检查 `storcli64`/`storcli` 是否存在, 但实际读取使用 `smartctl`; 未安装 storcli 也可以运行, 只会在安装时给出提示.
-- 默认 1600px 是集群统一高度; 如果某节点硬件更多导致截断, 请在所有节点统一提高 `PVE_MANAGER_STATUS_HEIGHT`. 硬件较少的节点会留白, 这是集群共享前端的取舍.
+- 自动高度是实验性功能: 如果切换节点后出现高度抖动、内部滚动条或遮挡, 先用上面的 localStorage 开关关闭, 回退到固定 1600px; 必要时再统一提高 `PVE_MANAGER_STATUS_HEIGHT`.
 - 阵列卡数据默认最多有 5 分钟缓存延迟; 需要立即刷新时执行 `systemctl start pve-storcli-cache.service`.
-- 上游的直连 SATA 硬盘监控代码未经过完整测试; 本 Fork 的阵列卡物理盘监控走独立的 `storcli_status` 模块, 不依赖该逻辑.
+- 本 Fork 的基础信息已内置 SATA/SAS 直连盘监控；SATA 控制器整卡直通给 VM 时宿主机看不到盘，需要在 VM 内监控.
+- SATA 解析结果默认缓存 300 秒（5 分钟），页面请求不会每次都执行 smartctl；如需调整，修改 `/usr/local/bin/pve_sata_parser.py` 中的 `TTL` 默认值.
 - nvme 硬盘监控部分对于 I/O 实时读写速度和延迟的实现代码使用目前常见的 iostat -d -x -k 1 1 但这将导致长时间运行后 iostat 进程休眠或被杀死, 你将会看到这部分监控参数"冻结", 在重启前将永远不再刷新, 目前尝试过使用其它方式实现这个功能避免冻结, 但都未能达到预期的效果, 有些实现方式复杂超出预期短期内无法解决, 另外一些能生效的方法则不够优雅, 会导致Web页面自动刷新间隔变得非常长.
 - 执行 `apt upgrade` 升级 `pve-manager` 后, 本项目的 Perl/JS 注入可能被覆盖. 重新执行 `pve-manager-status.sh` 和 `install-storcli-monitor.sh` 即可恢复.
 

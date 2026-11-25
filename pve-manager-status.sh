@@ -251,6 +251,7 @@ fi
 nodes="/usr/share/perl5/PVE/API2/Nodes.pm"
 pvemanagerlib="/usr/share/pve-manager/js/pvemanagerlib.js"
 pve_i18n_CN="/usr/share/pve-i18n/pve-lang-zh_CN.js"
+sata_parser_file="/usr/local/bin/pve_sata_parser.py"
 pvever=$(pveversion | awk -F"/" '{print $2}')
 pve_major_ver=$(echo "$pvever" | cut -d'.' -f1)
 
@@ -360,7 +361,7 @@ echo && sleep 0.5
 
 # 软件包依赖
 echo -e "🗃️ 正在检查依赖软件包:"
-dep_packages=(sudo sysstat lm-sensors smartmontools linux-cpupower)
+dep_packages=(sudo sysstat lm-sensors smartmontools linux-cpupower python3)
 dep_missing=()
 
 # 检查依赖状态
@@ -447,6 +448,7 @@ SENSORS_PATH=$(command -v sensors)
 TURBOSTAT_PATH=$(command -v turbostat)
 SMARTCTL_PATH=$(command -v smartctl)
 IOSTAT_PATH=$(command -v iostat)
+SATA_PARSER_PATH="/usr/local/bin/pve_sata_parser.py"
 
 # 配置 sudoers 规则内容
 echo -e "正在配置 sudoers 规则内容并进行语法检查..."
@@ -454,7 +456,7 @@ read -r -d '' SUDOERS_CONTENT << EOM
 # Allow www-data user (PVE Web GUI) to run specific hardware monitoring commands
 # This file is managed by pve-manager-status.sh (https://github.com/MiKing233/PVE-Manager-Status)
 
-Cmnd_Alias PVE_MANAGER_STATUS = ${SENSORS_PATH}, ${TURBOSTAT_PATH}, ${SMARTCTL_PATH}, ${IOSTAT_PATH}
+Cmnd_Alias PVE_MANAGER_STATUS = ${SENSORS_PATH}, ${TURBOSTAT_PATH}, ${SMARTCTL_PATH}, ${IOSTAT_PATH}, ${SATA_PARSER_PATH}
 Defaults!PVE_MANAGER_STATUS !log_allowed
 Defaults!PVE_MANAGER_STATUS !pam_session
 
@@ -462,6 +464,7 @@ www-data ALL=(root) NOPASSWD: ${SENSORS_PATH}
 www-data ALL=(root) NOPASSWD: ${TURBOSTAT_PATH} -S -q -s PkgWatt -i 0.1 -n 1 -c package
 www-data ALL=(root) NOPASSWD: ${SMARTCTL_PATH} -a /dev/*
 www-data ALL=(root) NOPASSWD: ${IOSTAT_PATH} -d -x -k 1 1
+www-data ALL=(root) NOPASSWD: ${SATA_PARSER_PATH}
 
 EOM
 
@@ -497,6 +500,394 @@ echo && sleep 0.5
 ####################   概要页面监控功能实现   ####################
 
 echo -e "📋 正在添加概要页面监控功能:"
+
+# 生成 SATA/SAS 直连盘 SMART 解析器
+echo -e "\n💽 正在生成 SATA SMART 解析器: ${sata_parser_file}"
+cat > "$sata_parser_file" << 'PVE_SATA_PARSER_EOF'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""PVE SATA/SAS direct-attached disk SMART parser.
+
+Output (one line per disk, disks separated by ||):
+model|temp|hours|defects|health|uncorrected|serial|mfg|read_gb|write_gb|unsafe|life
+"""
+
+import fcntl
+import glob
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+CACHE_DIR = os.environ.get("PVE_SATA_CACHE_DIR", "/var/cache/pve-manager")
+CACHE_FILE = os.path.join(CACHE_DIR, "sata.cache")
+LOCK_FILE = os.path.join(CACHE_DIR, "sata.lock")
+TTL = max(5, int(os.environ.get("PVE_SATA_TTL", "300")))
+
+SMARTCTL_DEFAULT = "/usr/sbin/smartctl"
+SMARTCTL = os.environ.get("PVE_SATA_SMARTCTL") or (
+    SMARTCTL_DEFAULT if os.path.exists(SMARTCTL_DEFAULT) else (shutil.which("smartctl") or SMARTCTL_DEFAULT)
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+LIFE_ATTRIBUTES = (
+    "Media_Wearout_Indicator",
+    "Wear_Leveling_Count",
+    "SSD_Life_Left",
+    "Percent_Lifetime_Remain",
+    "Remaining_Lifetime_Perc",
+)
+
+
+def _env():
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    env["LANG"] = "C"
+    return env
+
+
+def _run(args, timeout=15):
+    try:
+        proc = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_env(),
+            timeout=timeout,
+            check=False,
+        )
+        return proc.stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _smartctl(args, timeout=15):
+    if os.geteuid() == 0:
+        return _run([SMARTCTL] + args, timeout=timeout)
+    return _run(["sudo", "-n", SMARTCTL] + args, timeout=timeout)
+
+
+def _attr_raw(line):
+    parts = line.split()
+    return parts[9] if len(parts) >= 10 else ""
+
+
+def _attr_value(line):
+    parts = line.split()
+    return parts[3] if len(parts) >= 10 else ""
+
+
+def _leading_int(value):
+    match = re.match(r"(\d+)", value or "")
+    return int(match.group(1)) if match else None
+
+
+def _clean(value, fallback="-"):
+    value = str(value).replace("|", "/").replace("\r", " ").replace("\n", " ").strip()
+    return value if value else fallback
+
+
+def _lba_gb(value, is_ssd):
+    # 大多数盘按 512 字节 LBA 上报；部分 SSD 固件把 Total_LBAs 按 32MiB 为单位上报
+    if is_ssd and value < 1000000:
+        return value * 32.0 * 1024.0 * 1024.0 / 1000000000.0
+    return value * 512.0 / 1000000000.0
+
+
+def parse_disk(text):
+    model = "未知"
+    temp = "-"
+    hours = "-"
+    defects = 0
+    health = "OK"
+    uncorrected = 0
+    serial = "-"
+    mfg = "-"
+    read_gb = 0.0
+    write_gb = 0.0
+    unsafe = "-"
+    life = "-"
+    is_ssd = False
+    pending = 0
+    offline_unc = 0
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("Product:"):
+            model = line.split(":", 1)[1].strip()
+        elif line.startswith("Device Model:"):
+            model = line.split(":", 1)[1].strip()
+        elif line.startswith("Serial number:") or line.startswith("Serial Number:"):
+            serial = line.split(":", 1)[1].strip()
+        elif line.startswith("Manufactured in week"):
+            match = re.search(r"week\s+(\d+)\s+of\s+year\s+(\d+)", line, re.I)
+            if match:
+                mfg = "W{:02d} {}".format(int(match.group(1)), match.group(2))
+        elif "Current Drive Temperature:" in line or line.startswith("Drive Temperature:"):
+            match = re.search(r"(\d+)\s*C", line)
+            if match:
+                temp = match.group(1)
+        elif line.startswith("Accumulated power on time"):
+            match = re.search(r"(\d+):\d+", line)
+            if match:
+                hours = match.group(1)
+        elif "Power_On_Hours" in line and hours == "-":
+            value = _leading_int(_attr_raw(line))
+            if value is not None:
+                hours = str(value)
+        elif "Elements in grown defect list:" in line:
+            match = re.search(r":\s*(\d+)", line)
+            if match:
+                defects = int(match.group(1))
+        elif "Reallocated_Sector_Ct" in line and defects == 0:
+            value = _leading_int(_attr_raw(line))
+            if value is not None:
+                defects = value
+        elif "Current_Pending_Sector" in line:
+            value = _leading_int(_attr_raw(line))
+            if value is not None:
+                pending = value
+        elif "Offline_Uncorrectable" in line:
+            value = _leading_int(_attr_raw(line))
+            if value is not None:
+                offline_unc = value
+        elif line.startswith(("read:", "write:", "verify:")):
+            parts = line.split()
+            if len(parts) >= 8:
+                try:
+                    gb = float(parts[6])
+                    unc = int(parts[7])
+                except ValueError:
+                    continue
+                if line.startswith("read:"):
+                    read_gb = gb
+                elif line.startswith("write:"):
+                    write_gb = gb
+                uncorrected += max(0, unc)
+        elif "Reported_Uncorrect" in line:
+            value = _leading_int(_attr_raw(line))
+            if value:
+                uncorrected += value
+        elif "Unsafe_Shutdown_Count" in line or "Power_Loss_Count" in line:
+            value = _leading_int(_attr_raw(line))
+            if value is not None:
+                unsafe = value
+        elif any(name in line for name in LIFE_ATTRIBUTES):
+            value = _leading_int(_attr_value(line))
+            if value is not None:
+                life = value
+        elif "Percentage used endurance indicator:" in line:
+            match = re.search(r"(\d+)\s*%", line)
+            if match:
+                life = max(0, 100 - int(match.group(1)))
+        elif (
+            "Temperature_Celsius" in line
+            or "Temperature_Case" in line
+            or "Temperature_Internal" in line
+            or "Airflow_Temperature_Cel" in line
+        ):
+            if temp == "-":
+                match = re.match(r"(\d+)", _attr_raw(line))
+                if match:
+                    temp = match.group(1)
+        elif "SMART Health Status:" in line:
+            if "OK" not in line:
+                health = "警告"
+        elif "SMART overall-health self-assessment test result:" in line:
+            if "PASSED" not in line:
+                health = "警告"
+        elif "Host_Reads_32MiB" in line:
+            value = _leading_int(_attr_raw(line))
+            if value is not None:
+                read_gb = value * 32.0 / 1024.0
+        elif "Host_Writes_32MiB" in line:
+            value = _leading_int(_attr_raw(line))
+            if value is not None:
+                write_gb = value * 32.0 / 1024.0
+        elif "Total_LBAs_Read" in line:
+            value = _leading_int(_attr_raw(line))
+            if value is not None:
+                read_gb = _lba_gb(value, is_ssd)
+        elif "Total_LBAs_Written" in line:
+            value = _leading_int(_attr_raw(line))
+            if value is not None:
+                write_gb = _lba_gb(value, is_ssd)
+        elif line.startswith("Rotation Rate:") and "Solid State" in line:
+            is_ssd = True
+
+    if model == "未知":
+        return None
+
+    # 真实的 SATA/SAS 盘至少应能读到温度或通电时间之一
+    if temp == "-" and hours == "-":
+        return None
+
+    # 坏道汇总：重映射 + 待映射
+    defects = max(defects, 0) + max(pending, 0)
+    uncorrected = max(uncorrected, 0) + max(offline_unc, 0)
+
+    if mfg == "-" and "INTEL" in model.upper():
+        match = re.match(r"^[A-Z]{4}(\d)(\d{2})", serial.upper())
+        if match:
+            year = 2010 + int(match.group(1))
+            week = int(match.group(2))
+            if 1 <= week <= 53:
+                mfg = "W{:02d} {}".format(week, year)
+
+    if is_ssd and "(SSD)" not in model:
+        model = model + " (SSD)"
+
+    read_str = "{:.1f}".format(read_gb) if read_gb > 0 else "0"
+    write_str = "{:.1f}".format(write_gb) if write_gb > 0 else "0"
+
+    values = [
+        _clean(model, "未知"),
+        _clean(temp, "-"),
+        _clean(hours, "-"),
+        str(defects),
+        _clean(health, "OK"),
+        str(uncorrected),
+        _clean(serial, "-"),
+        _clean(mfg, "-"),
+        read_str,
+        write_str,
+        _clean(unsafe, "-"),
+        _clean(life, "-"),
+    ]
+    return "|".join(values)
+
+
+def list_devices():
+    devices = []
+    for path in sorted(glob.glob("/dev/sd*")):
+        if not re.match(r"^/dev/sd[a-z]+$", path):
+            continue
+        try:
+            if not stat.S_ISBLK(os.stat(path).st_mode):
+                continue
+        except OSError:
+            continue
+        devices.append(path)
+    return devices
+
+
+def refresh():
+    rows = []
+    for dev in list_devices():
+        output = _smartctl(["-a", dev], timeout=20)
+        if "Device Model:" not in output and "Product:" not in output:
+            fallback = _smartctl(["-a", "-d", "sat", dev], timeout=20)
+            if fallback:
+                output = fallback
+        if not output:
+            continue
+        row = parse_disk(output)
+        if row:
+            rows.append(row)
+    return "||".join(rows)
+
+
+def _ensure_cache_files():
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        os.chmod(CACHE_DIR, 0o755)
+    except OSError:
+        pass
+
+
+def read_cache(ignore_ttl=False):
+    try:
+        if not ignore_ttl and time.time() - os.path.getmtime(CACHE_FILE) > TTL:
+            return None
+        with open(CACHE_FILE, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
+def write_cache(value):
+    tmp_file = "{}.tmp.{}".format(CACHE_FILE, os.getpid())
+    try:
+        with open(tmp_file, "w", encoding="utf-8") as handle:
+            handle.write(value)
+        os.chmod(tmp_file, 0o644)
+        os.replace(tmp_file, CACHE_FILE)
+    except OSError:
+        try:
+            os.unlink(tmp_file)
+        except OSError:
+            pass
+
+
+def main():
+    cached = read_cache()
+    if cached is not None:
+        print(cached)
+        return 0
+
+    _ensure_cache_files()
+
+    lock_handle = None
+    try:
+        lock_handle = open(LOCK_FILE, "a+")
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(read_cache(ignore_ttl=True) or "")
+            return 0
+
+        value = refresh()
+        stale = read_cache(ignore_ttl=True)
+        if value:
+            write_cache(value)
+            print(value)
+        elif stale:
+            # 本次读取失败时保留上一份有效数据，避免页面闪烁
+            print(stale)
+        else:
+            # 不缓存空结果，下一次页面请求会重试
+            print("")
+        return 0
+    except Exception:
+        print(read_cache(ignore_ttl=True) or "")
+        return 1
+    finally:
+        if lock_handle is not None:
+            try:
+                fcntl.flock(lock_handle, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock_handle.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PVE_SATA_PARSER_EOF
+
+chmod 0755 "$sata_parser_file"
+chown root:root "$sata_parser_file"
+sed -i "s|^SMARTCTL_DEFAULT = .*|SMARTCTL_DEFAULT = \"${SMARTCTL_PATH}\"|" "$sata_parser_file"
+
+install -d -m 0755 -o root -g root /var/cache/pve-manager
+
+if ! python3 - "$sata_parser_file" << 'PYCHECK'
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    compile(handle.read(), sys.argv[1], "exec")
+PYCHECK
+then
+    echo -e "⛔ SATA SMART 解析器语法检查失败"
+    exit 1
+fi
+echo "SATA SMART 解析器已生成 ✅"
 
 # 修改 node.pm 文件前置步骤
 tmpf1=$(mktemp /tmp/pve-manager-status.XXXXXX) || exit 1
@@ -538,7 +929,7 @@ EOF
 
 cat >> "$tmpf1" << 'EOF'
 
-        $res->{sata_status} = `sudo smartctl -a /dev/sd? | grep -E "Device Model|Capacity|Power_On_Hours|Temperature"`;
+        $res->{sata_status} = `sudo /usr/local/bin/pve_sata_parser.py`;
 EOF
 
 # 在实际修改前检查锚点文本是否存在, 若不存在则报错退出停止修改
@@ -1173,88 +1564,88 @@ cat >> "$tmpf2" << 'EOF'
             title: gettext('SATA硬盘'),
             textField: 'sata_status',
             renderer: function(value) {
-                function colorizeHddTemp(temp) {
-                    const tempNum = parseFloat(temp);
-                    if (tempNum < 40) return `<span style="color:var(--pve-manager-status-low); font-weight:bold;">${temp}°C</span>`;
-                    if (tempNum < 50) return `<span style="color:var(--pve-manager-status-medium); font-weight:bold;">${temp}°C</span>`;
-                    return `<span style="color:var(--pve-manager-status-high); font-weight:bold;">${temp}°C</span>`;
+                if (!value || String(value).trim() === '') {
+                    return '提示: 未检测到 SATA 硬盘';
                 }
-                if (value.length > 0) {
-                try {
-                const jsonData = JSON.parse(value);
-                if (jsonData.standy === true) {
-                return '休眠中';
+                function esc(v) {
+                    return String(v === undefined || v === null ? '' : v).replace(/[&<>"']/g, function(c) {
+                        return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c];
+                    });
                 }
-                let output = '';
-                if (jsonData.model_name) {
-                output = `<strong>${jsonData.model_name}</strong><br>`;
-                        if (jsonData.temperature?.current !== undefined) {
-                        output += `温度: <strong>${colorizeHddTemp(jsonData.temperature.current)}</strong>`;
-                        }
-                        if (jsonData.power_on_time?.hours !== undefined) {
-                        if (output.length > 0) output += ' | ';
-                        output += `通电: ${jsonData.power_on_time.hours}小时`;
-                        if (jsonData.power_cycle_count) {
-                        output += `, 次数: ${jsonData.power_cycle_count}`;
-                        }
-                        }
-                        if (jsonData.smart_status?.passed !== undefined) {
-                        if (output.length > 0) output += ' | ';
-                        output += 'SMART: ' + (jsonData.smart_status.passed ? '正常' : '警告!');
-                        }
-                        return output;
-                        }
-                        } catch (e) {
-                        }
-                        let outputs = [];
-                        let devices = value.matchAll(/(\s*(Model|Device Model|Vendor).*:\s*[\s\S]*?\n){1,2}^User.*\[([\s\S]*?)\]\n^\s*9[\s\S]*?\-\s*([\d]+)[\s\S]*?(\n(^19[0,4][\s\S]*?$){1,2}|\s{0}$)/gm);
-                        for (const device of devices) {
-                        let devicemodel = '';
-                        if (device[1].indexOf("Family") !== -1) {
-                        devicemodel = device[1].replace(/.*Model Family:\s*([\s\S]*?)\n^Device Model:\s*([\s\S]*?)\n/m, '$1 - $2');
-                        } else if (device[1].match(/Vendor/)) {
-                        devicemodel = device[1].replace(/.*Vendor:\s*([\s\S]*?)\n^.*Model:\s*([\s\S]*?)\n/m, '$1 $2');
-                        } else {
-                        devicemodel = device[1].replace(/.*(Model|Device Model):\s*([\s\S]*?)\n/m, '$2');
-                        }
-                        let capacity = device[3] ? device[3].replace(/ |,/gm, '') : "未知容量";
-                        let powerOnHours = device[4] || "未知";
-                        let deviceOutput = '';
-                        if (value.indexOf("Min/Max") !== -1) {
-                        let devicetemps = device[6]?.matchAll(/19[0,4][\s\S]*?\-\s*(\d+)(\s\(Min\/Max\s(\d+)\/(\d+)\)$|\s{0}$)/gm);
-                        for (const devicetemp of devicetemps || []) {
-                            deviceOutput = `<strong>${devicemodel}</strong><br>容量: ${capacity} | 已通电: ${powerOnHours}小时 | 温度: <strong>${colorizeHddTemp(devicetemp[1])}</strong>`;
-                            outputs.push(deviceOutput);
-                        }
-                        } else if (value.indexOf("Temperature") !== -1 || value.match(/Airflow_Temperature/)) {
-                        let devicetemps = device[6]?.matchAll(/19[0,4][\s\S]*?\-\s*(\d+)/gm);
-                        for (const devicetemp of devicetemps || []) {
-                        deviceOutput = `<strong>${devicemodel}</strong><br>容量: ${capacity} | 已通电: ${powerOnHours}小时 | 温度: <strong>${colorizeHddTemp(devicetemp[1])}</strong>`;
-                        outputs.push(deviceOutput);
-                        }
-                        } else {
-                        if (value.match(/\/dev\/sd[a-z]/)) {
-                            deviceOutput = `<strong>${devicemodel}</strong><br>容量: ${capacity} | 已通电: ${powerOnHours}小时 | 提示: 设备存在但未报告温度信息`;
-                            outputs.push(deviceOutput);
-                        } else {
-                            deviceOutput = `<strong>${devicemodel}</strong><br>容量: ${capacity} | 已通电: ${powerOnHours}小时 | 提示: 未检测到温度传感器`;
-                            outputs.push(deviceOutput);
-                        }
-                        }
-                        }
-                        if (!outputs.length && value.length > 0) {
-                        let fallbackDevices = value.matchAll(/(\/dev\/sd[a-z]).*?Model:([\s\S]*?)\n/gm);
-                        for (const fallbackDevice of fallbackDevices || []) {
-                            outputs.push(`${fallbackDevice[2].trim()}<br>提示: 设备存在但无法获取完整信息`);
-                        }
-                        }
-                        return outputs.length ? outputs.join('<br>') : '提示: 检测到硬盘但无法识别详细信息';
-                    } else {
-                        return '提示: 未安装 SATA硬盘 或已直通 SATA控制器!';
+                function formatSize(gbStr) {
+                    var gb = parseFloat(gbStr);
+                    if (isNaN(gb) || gb <= 0) return '0 GB';
+                    if (gb >= 1048576) return (gb / 1048576).toFixed(2) + ' PB';
+                    if (gb >= 1024) return (gb / 1024).toFixed(2) + ' TB';
+                    if (gb < 1) return (gb * 1024).toFixed(1) + ' MB';
+                    return gb.toFixed(1) + ' GB';
                 }
+                function colorizeTemp(temp) {
+                    var t = parseInt(temp, 10);
+                    if (isNaN(t)) return esc(temp);
+                    if (t < 50) return '<span style="color:var(--pve-manager-status-low, #008000); font-weight:bold;">' + t + '°C</span>';
+                    if (t < 70) return '<span style="color:var(--pve-manager-status-medium, #ffa500); font-weight:bold;">' + t + '°C</span>';
+                    return '<span style="color:var(--pve-manager-status-high, #ff0000); font-weight:bold;">' + t + '°C</span>';
+                }
+                function colorizeNum(num, isError) {
+                    var n = parseInt(num, 10);
+                    if (isNaN(n)) return esc(num);
+                    if (n === 0) return '<span style="color:var(--pve-manager-status-low, #008000);">0</span>';
+                    var color = isError ? 'var(--pve-manager-status-high, #ff0000)' : 'var(--pve-manager-status-medium, #ffa500)';
+                    return '<span style="color:' + color + '; font-weight:bold;">' + n + '</span>';
+                }
+                function colorizeLife(life) {
+                    var n = parseInt(life, 10);
+                    if (isNaN(n)) return esc(life);
+                    var color = n >= 80 ? 'var(--pve-manager-status-low, #008000)' :
+                                (n >= 50 ? 'var(--pve-manager-status-medium, #ffa500)' : 'var(--pve-manager-status-high, #ff0000)');
+                    return '<span style="color:' + color + '; font-weight:bold;">' + n + '%</span>';
+                }
+                function colorizeUnsafe(count) {
+                    var n = parseInt(count, 10);
+                    if (isNaN(n)) return esc(count);
+                    return n + '次';
+                }
+                var disks = String(value).split('||').filter(function(x) { return x.trim() !== ''; });
+                var output = [];
+                for (var i = 0; i < disks.length; i++) {
+                    var d = disks[i].trim().split('|');
+                    if (d.length < 10) {
+                        output.push(esc(disks[i]));
+                        continue;
+                    }
+                    var model = d[0], temp = d[1], hour = d[2], defects = d[3], health = d[4];
+                    var uncorrected = d[5], serial = d[6], mfg = d[7], readgb = d[8], writegb = d[9];
+                    var unsafe = d.length > 10 ? d[10] : '-';
+                    var life = d.length > 11 ? d[11] : '-';
+                    var hours = parseInt(hour, 10);
+                    var years = isNaN(hours) ? '-' : (hours / 8760).toFixed(1);
+                    var lifeNum = parseInt(life, 10);
+                    var modelColor = !isNaN(lifeNum) ?
+                        (lifeNum >= 80 ? 'var(--pve-manager-status-low, #008000)' :
+                         (lifeNum >= 50 ? 'var(--pve-manager-status-medium, #ffa500)' : 'var(--pve-manager-status-high, #ff0000)')) :
+                        (health === 'OK' ? 'var(--pve-manager-status-low, #008000)' : 'var(--pve-manager-status-high, #ff0000)');
+                    var healthColor = health === 'OK' ? 'var(--pve-manager-status-low, #008000)' : 'var(--pve-manager-status-high, #ff0000)';
+                    var line1 = '<span style="color:' + modelColor + '; font-weight:bold;">' + esc(model) + '</span>' +
+                                ' | 温度: ' + colorizeTemp(temp) +
+                                ' | 通电: ' + (isNaN(hours) ? esc(hour) : hours + 'h (' + years + '年)') +
+                                ' | 状态: <span style="color:' + healthColor + '; font-weight:bold;">' + esc(health) + '</span>';
+                    var line2 = 'SN: ' + esc(serial) +
+                                ' | 生产: ' + esc(mfg) +
+                                ' | 坏道: ' + colorizeNum(defects, false) +
+                                ' | 无法纠错: ' + colorizeNum(uncorrected, true);
+                    var line3Parts = [];
+                    if (!isNaN(lifeNum)) line3Parts.push('寿命: ' + colorizeLife(life));
+                    if (!isNaN(parseInt(unsafe, 10))) line3Parts.push('不安全断电: ' + colorizeUnsafe(unsafe));
+                    line3Parts.push('已读: ' + formatSize(readgb));
+                    line3Parts.push('已写: ' + formatSize(writegb));
+                    output.push(line1 + '<br>' + line2 + '<br>' + line3Parts.join(' | '));
+                }
+                return output.join('<br>');
             }
         },
 EOF
+
 
 # 计算插入行号
 ln=$(sed -n '/pveversion/,+10{/},/{=;q}}' $pvemanagerlib)
@@ -1302,8 +1693,175 @@ cat >> "$pvemanagerlib" << 'EOF'
 })();
 EOF
 
+# 节点概要自动高度（集群共享前端，按当前节点实际内容调整）
+cat >> "$pvemanagerlib" << 'EOF'
+
+// === PVE-Manager-Status: 集群节点概要自动高度 (experimental) ===
+;(() => {
+    const STORAGE_KEY = 'pve-manager-status-auto-height';
+    const PANEL_ID_PREFIX = 'pveNodeStatus-';
+    const DEBUG = (() => {
+        try {
+            return localStorage.getItem('pve-manager-status-auto-height-debug') === '1';
+        } catch (e) {
+            return false;
+        }
+    })();
+
+    function isDisabled() {
+        try {
+            return localStorage.getItem(STORAGE_KEY) === '0';
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function log(...args) {
+        if (DEBUG) console.debug('[pve-manager-status height]', ...args);
+    }
+
+    function findContentTable(panelEl) {
+        const body = panelEl.querySelector('.x-panel-body') || panelEl;
+        const preferred = body.querySelectorAll('table.x-table-layout, table.x-table-layout-ct');
+        const candidates = preferred.length ? preferred : body.querySelectorAll('table');
+        let best = null;
+        let bestHeight = 0;
+        for (const table of candidates) {
+            const height = table.offsetHeight || 0;
+            if (height > bestHeight) {
+                bestHeight = height;
+                best = table;
+            }
+        }
+        return best;
+    }
+
+    function measure(view) {
+        if (!view || !view.el || !view.el.dom) return;
+        const panelEl = view.el.dom;
+        const table = findContentTable(panelEl);
+        if (!table) return;
+        const tableHeight = table.offsetHeight || 0;
+        if (tableHeight < 40) return;
+
+        const header = panelEl.querySelector('.x-panel-header');
+        const headerHeight = header ? (header.offsetHeight || 0) : 0;
+        const body = panelEl.querySelector('.x-panel-body');
+        let padding = 0;
+        if (body) {
+            const style = window.getComputedStyle(body);
+            padding = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
+        }
+
+        const needed = Math.ceil(tableHeight + headerHeight + padding + 4);
+        const current = view.getHeight ? view.getHeight() : (panelEl.offsetHeight || 0);
+        if (current && Math.abs(current - needed) <= 2) return;
+
+        log('resize', { current, needed, tableHeight, headerHeight, padding });
+        try {
+            if (view.setHeight) {
+                view.setHeight(needed);
+            } else {
+                panelEl.style.height = needed + 'px';
+            }
+            if (view.updateLayout) view.updateLayout();
+        } catch (e) {
+            log('resize failed', e);
+        }
+    }
+
+    function schedule(view) {
+        if (isDisabled() || !view) return;
+        const raf = window.requestAnimationFrame
+            ? window.requestAnimationFrame.bind(window)
+            : (cb) => setTimeout(cb, 16);
+        raf(() => raf(() => measure(view)));
+        setTimeout(() => measure(view), 80);
+        setTimeout(() => measure(view), 300);
+    }
+
+    function attach(view) {
+        if (!view || view.__pmsAutoHeightAttached) return;
+        if (!view.el || !view.el.dom) return;
+        view.__pmsAutoHeightAttached = true;
+        const table = findContentTable(view.el.dom);
+        if (table && window.ResizeObserver) {
+            const observer = new ResizeObserver(() => {
+                if (!isDisabled()) schedule(view);
+            });
+            observer.observe(table);
+            view.__pmsAutoHeightObserver = observer;
+        }
+    }
+
+    function hook() {
+        const proto = window.PVE && PVE.node && PVE.node.StatusView && PVE.node.StatusView.prototype;
+        if (!proto) return false;
+        if (proto.__pmsAutoHeightHooked) return true;
+        proto.__pmsAutoHeightHooked = true;
+        ['updateTitle', 'updateValues'].forEach((name) => {
+            const original = proto[name];
+            if (typeof original !== 'function') return;
+            proto[name] = function() {
+                const result = original.apply(this, arguments);
+                schedule(this);
+                attach(this);
+                return result;
+            };
+        });
+        return true;
+    }
+
+    if (!hook()) {
+        let tries = 0;
+        const timer = setInterval(() => {
+            if (hook() || ++tries > 50) clearInterval(timer);
+        }, 100);
+    }
+
+    function findView() {
+        if (!window.Ext || !Ext.getCmp) return null;
+        const panels = document.querySelectorAll('[id^="' + PANEL_ID_PREFIX + '"]');
+        let candidate = null;
+        for (const panel of panels) {
+            const rect = panel.getBoundingClientRect
+                ? panel.getBoundingClientRect()
+                : { height: panel.offsetHeight || 0 };
+            if (!panel.offsetParent && (!rect || rect.height === 0)) continue;
+            if (!candidate || (panel.offsetHeight || 0) > (candidate.offsetHeight || 0)) {
+                candidate = panel;
+            }
+        }
+        if (!candidate) return null;
+        return Ext.getCmp(candidate.id) || null;
+    }
+
+    function scan() {
+        if (isDisabled()) return;
+        const view = findView();
+        if (view) {
+            attach(view);
+            schedule(view);
+        }
+    }
+
+    function watch() {
+        if (!document.body) return;
+        // 节点切换/首次创建时靠 updateTitle/updateValues 可能来不及，2 秒兜底扫描一次
+        setInterval(scan, 2000);
+        scan();
+    }
+
+    if (document.body) {
+        watch();
+    } else {
+        document.addEventListener('DOMContentLoaded', watch, { once: true });
+    }
+})();
+EOF
+
 # 验证修改是否成功
-if grep -q "itemId: 'cpupower'" "$pvemanagerlib"; then
+if grep -q "itemId: 'cpupower'" "$pvemanagerlib" && grep -q "pve-manager-status-auto-height" "$pvemanagerlib"; then
     echo "已完成修改: $pvemanagerlib ✅"
 else
     echo "⛔ 检查对 $pvemanagerlib 添加的内容未生效!"
